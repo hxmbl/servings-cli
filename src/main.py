@@ -14,6 +14,7 @@ if _project_root not in sys.path:
 
 import typer  # noqa: E402
 
+from src.server import _kill_previous  # noqa: E402
 from src.server import serve as _serve  # noqa: E402
 
 app = typer.Typer()
@@ -162,6 +163,12 @@ def _detect_android_ip() -> str | None:
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             continue
     return None
+
+
+@app.command()
+def kill() -> None:
+    """Kill any running servings-cli server processes."""
+    _kill_previous()
 
 
 @app.command()

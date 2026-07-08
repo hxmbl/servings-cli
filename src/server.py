@@ -5,6 +5,7 @@ Non-root mode: ProxyDHCP on 4011 + TFTP on 6969 (no privileges needed).
 """
 
 import os
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,6 +14,28 @@ from src.boot_config import generate_boot_config
 from src.http_server import _http_server
 from src.proxydhcp import _proxydhcp_listener
 from src.tftp import _tftp_listener
+
+
+def _kill_previous() -> None:
+    """Kill any existing servings-cli server processes to free ports."""
+    if os.name == "nt":
+        return
+    try:
+        my_pid = os.getpid()
+        result = subprocess.run(
+            ["pgrep", "-f", "src.main serve"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            pid = int(line.strip())
+            if pid != my_pid:
+                try:
+                    os.kill(pid, 9)
+                    print(f"[*] Killed old serve process (PID {pid})")
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
 
 
 def _check_root() -> None:
@@ -38,6 +61,7 @@ def serve(
     boot_file: str = "undionly.kpxe",
     android: bool = False,
 ) -> None:
+    _kill_previous()
     root = Path(boot_dir).resolve()
     if not root.exists():
         print(f"[!] Boot directory does not exist: {root}")
