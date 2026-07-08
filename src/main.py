@@ -197,11 +197,13 @@ def serve(
     Non-root mode: ProxyDHCP on 4011 + TFTP on 6969.
     Works alongside your existing DHCP server.
 
+    --android implies --no-root automatically.
+
     Examples:
       sudo servings-cli serve
       sudo servings-cli serve --server-ip 192.168.1.100
       servings-cli serve --no-root
-      servings-cli serve --android --no-root
+      servings-cli serve --android
     """
     if not server_ip:
         if android:
@@ -213,6 +215,9 @@ def serve(
                 server_ip = "192.168.42.129"
         else:
             server_ip = "192.168.42.129"
+
+    # --android implies root (phone has su, ports 67/69 work fine)
+    # Pass --no-root explicitly to use non-root ports 4011/6969
 
     resolved = _resolve_boot_dir(boot_dir, android=android)
     _serve(
