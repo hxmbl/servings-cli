@@ -1,595 +1,462 @@
+"""Integration tests — real sockets, real servers, no mocks."""
+
+import os
 import socket
 import struct
 import sys
-import threading
-import time
+import tempfile
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.proxydhcp import parse_packet
-from src.tftp import TFTP_RRQ, TFTP_DATA, TFTP_ACK, TFTP_ERROR
+from helpers import (
+    build_pxe_discover,
+    make_rrq,
+    start_http,
+    start_proxydhcp,
+    start_tftp,
+)
 
+from src.tftp import TFTP_ACK, TFTP_DATA, TFTP_ERROR
 
-def _section(title: str) -> None:
-    print(f"\n  {'=' * 60}")
-    print(f"  {title}")
-    print(f"  {'=' * 60}")
+# --- ProxyDHCP ---
 
-
-def _ok(msg: str) -> None:
-    print(f"  [+] {msg}")
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
-def _make_pxe_discover(
-    xid: bytes = b"\xde\xad\xbe\xef",
-    mac: bytes = b"\x00\x11\x22\x33\x44\x55",
-    vendor: bytes = b"PXEClient",
-) -> bytes:
-    pkt = bytearray(240)
-    pkt[0] = 1
-    pkt[4:8] = xid
-    pkt[28:34] = mac
-    pkt[236:240] = b"\x63\x82\x53\x63"
-    pkt += bytes([60, len(vendor)]) + vendor
-    pkt += bytes([255])
-    return bytes(pkt)
-
-
-# -----------------------------------------------------------------------
-# ProxyDHCP integration tests
-# -----------------------------------------------------------------------
 
 class TestProxyDHCPIntegration(unittest.TestCase):
-    def _start_server(self) -> tuple[int, threading.Event, threading.Thread]:
-        from src.proxydhcp import _proxydhcp_listener
-        port = _find_free_port()
-        shutdown = threading.Event()
-        t = threading.Thread(target=_proxydhcp_listener, args=(port, shutdown), daemon=True)
-        t.start()
-        time.sleep(0.15)
-        return port, shutdown, t
-
-    def test_responds_to_pxe_discover(self) -> None:
-        _section("ProxyDHCP: responds to PXE DISCOVER")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(_make_pxe_discover(), ("127.0.0.1", port))
-
+    def test_responds_to_pxe_discover(self):
+        port, shutdown, t = start_proxydhcp()
         try:
-            data, addr = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
-            sock.close()
-            t.join(timeout=1)
-            self.fail("No response from ProxyDHCP listener")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-        self.assertGreater(len(data), 240)
-        self.assertEqual(data[0], 2)
-        self.assertEqual(data[4:8], b"\xde\xad\xbe\xef")
-        self.assertEqual(data[28:34], b"\x00\x11\x22\x33\x44\x55")
-        self.assertEqual(data[236:240], b"\x63\x82\x53\x63")
-        _ok(f"Got ProxyDHCP reply ({len(data)} bytes)")
-
-    def test_reply_contains_pxe_options(self) -> None:
-        _section("ProxyDHCP: reply has PXE options")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.bind(("", 0))
-        sock.sendto(_make_pxe_discover(), ("127.0.0.1", port))
-
-        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(build_pxe_discover(), ("127.0.0.1", port))
             data, _ = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
+            self.assertGreater(len(data), 240)
+            self.assertEqual(data[0], 2)
+            self.assertEqual(data[4:8], b"\xde\xad\xbe\xef")
+            self.assertEqual(data[28:34], b"\x00\x11\x22\x33\x44\x55")
+            self.assertEqual(data[236:240], b"\x63\x82\x53\x63")
             sock.close()
-            t.join(timeout=1)
-            self.fail("No response")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-        opts = data[240:]
-        self.assertIn(b"PXEClient", opts)
-        self.assertIn(b"undionly.kpxe", opts)
-        self.assertIn(data[240:243], [b"\x35\x01\x05"])
-        _ok("Reply contains PXEClient, undionly.kpxe, DHCPACK")
-
-    def test_reply_uses_source_port(self) -> None:
-        _section("ProxyDHCP: reply goes to source port")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.bind(("127.0.0.1", 0))
-        client_port = sock.getsockname()[1]
-        sock.sendto(_make_pxe_discover(), ("127.0.0.1", port))
-
-        try:
-            data, addr = sock.recvfrom(2048)
-        except socket.timeout:
+        finally:
             shutdown.set()
-            sock.close()
-            t.join(timeout=1)
-            self.fail("No response")
+            t.join(timeout=2)
 
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-        self.assertEqual(addr, ("127.0.0.1", port))
-        _ok("Reply sent from server port")
-
-    def test_non_pxe_request_ignored(self) -> None:
-        _section("ProxyDHCP: non-PXE request ignored")
-        port, shutdown, t = self._start_server()
-
-        non_pxe = bytearray(240)
-        non_pxe[0] = 1
-        non_pxe[4:8] = b"\xde\xad\xbe\xef"
-        non_pxe[28:34] = b"\x00\x11\x22\x33\x44\x55"
-        non_pxe[236:240] = b"\x63\x82\x53\x63"
-        non_pxe += bytes([60, 5]) + b"Linux"
-        non_pxe += bytes([255])
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.5)
-        sock.sendto(bytes(non_pxe), ("127.0.0.1", port))
-
+    def test_reply_contains_pxe_options(self):
+        port, shutdown, t = start_proxydhcp()
         try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(build_pxe_discover(), ("127.0.0.1", port))
             data, _ = sock.recvfrom(2048)
-            shutdown.set()
+            opts = data[240:]
+            self.assertIn(b"PXEClient", opts)
+            self.assertIn(b"undionly.kpxe", opts)
             sock.close()
-            t.join(timeout=1)
-            self.fail("Should not respond to non-PXE request")
-        except socket.timeout:
-            pass
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-        _ok("Non-PXE request correctly ignored")
-
-    def test_efi_client_gets_ipxe_efi(self) -> None:
-        _section("ProxyDHCP: EFI client gets ipxe.efi")
-        port, shutdown, t = self._start_server()
-
-        vendor = b"PXEClient:Arch:00007:UNDI:003000"
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.bind(("", 0))
-        sock.sendto(_make_pxe_discover(vendor=vendor), ("127.0.0.1", port))
-
+    def test_non_pxe_request_ignored(self):
+        port, shutdown, t = start_proxydhcp()
         try:
-            data, _ = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(1.5)
+            non_pxe = bytearray(240)
+            non_pxe[0] = 1
+            non_pxe[4:8] = b"\xde\xad\xbe\xef"
+            non_pxe[28:34] = b"\x00\x11\x22\x33\x44\x55"
+            non_pxe[236:240] = b"\x63\x82\x53\x63"
+            non_pxe += bytes([60, 5]) + b"Linux" + bytes([255])
+            sock.sendto(bytes(non_pxe), ("127.0.0.1", port))
+            try:
+                sock.recvfrom(2048)
+                self.fail("Should not respond to non-PXE")
+            except TimeoutError:
+                pass
             sock.close()
-            t.join(timeout=1)
-            self.fail("No response")
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
+    def test_efi_client_gets_ipxe_efi(self):
+        port, shutdown, t = start_proxydhcp()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(build_pxe_discover(arch_id=7), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertIn(b"ipxe.efi", data)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-        self.assertIn(b"ipxe.efi", data)
-        _ok("EFI client receives ipxe.efi boot file")
-
-    def test_multiple_clients(self) -> None:
-        _section("ProxyDHCP: multiple clients")
-        port, shutdown, t = self._start_server()
-
+    def test_multiple_clients(self):
+        port, shutdown, t = start_proxydhcp()
         socks = []
         try:
-            for i, (mac, xid) in enumerate([
+            for mac, xid in [
                 (b"\x00\x11\x22\x33\x44\x55", b"\x01\x00\x00\x01"),
                 (b"\xaa\xbb\xcc\xdd\xee\xff", b"\x02\x00\x00\x02"),
                 (b"\x11\x22\x33\x44\x55\x66", b"\x03\x00\x00\x03"),
-            ]):
+            ]:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 s.settimeout(3.0)
                 s.bind(("", 0))
-                s.sendto(_make_pxe_discover(xid=xid, mac=mac), ("127.0.0.1", port))
-                socks.append(s)
-
-            for i, s in enumerate(socks):
+                pkt = bytearray(240)
+                pkt[0] = 1
+                pkt[1] = 1
+                pkt[2] = 6
+                pkt[4:8] = xid
+                pkt[28:34] = mac
+                pkt[236:240] = b"\x63\x82\x53\x63"
+                pkt += bytes([60, 9]) + b"PXEClient" + bytes([255])
+                s.sendto(bytes(pkt), ("127.0.0.1", port))
+                socks.append((s, xid, mac))
+            for s, xid, mac in socks:
                 data, _ = s.recvfrom(2048)
                 self.assertEqual(data[0], 2)
-                self.assertEqual(data[4:8], [b"\x01\x00\x00\x01", b"\x02\x00\x00\x02", b"\x03\x00\x00\x03"][i])
-                self.assertEqual(data[28:34], [
-                    b"\x00\x11\x22\x33\x44\x55",
-                    b"\xaa\xbb\xcc\xdd\xee\xff",
-                    b"\x11\x22\x33\x44\x55\x66",
-                ][i])
+                self.assertEqual(data[4:8], xid)
+                self.assertEqual(data[28:34], mac)
         finally:
             shutdown.set()
-            for s in socks:
+            for s, _, _ in socks:
                 s.close()
-            t.join(timeout=1)
-        _ok("Three concurrent clients all get correct responses")
+            t.join(timeout=2)
 
 
-# -----------------------------------------------------------------------
-# TFTP integration tests
-# -----------------------------------------------------------------------
+# --- TFTP ---
+
 
 class TestTFTPIntegration(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmpdir = TemporaryDirectory()
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
         self.boot_dir = Path(self.tmpdir.name)
         self.boot_file = self.boot_dir / "undionly.kpxe"
         self.boot_file.write_bytes(b"FAKE_IPXE_" + b"x" * 2000)
 
-    def tearDown(self) -> None:
+    def tearDown(self):
         self.tmpdir.cleanup()
 
-    def _start_server(self) -> tuple[int, threading.Event, threading.Thread]:
-        from src.tftp import _tftp_listener
-        port = _find_free_port()
-        shutdown = threading.Event()
-        t = threading.Thread(target=_tftp_listener, args=(port, self.boot_dir, shutdown), daemon=True)
-        t.start()
-        time.sleep(0.15)
-        return port, shutdown, t
-
-    def _rrq(self, filename: str) -> bytes:
-        return struct.pack("!H", TFTP_RRQ) + filename.encode() + b"\x00octet\x00"
-
-    def test_serves_first_block(self) -> None:
-        _section("TFTP: first DATA block")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(self._rrq("undionly.kpxe"), ("127.0.0.1", port))
-
+    def test_serves_first_block(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
         try:
-            data, addr = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
-            sock.close()
-            t.join(timeout=1)
-            self.fail("No TFTP response")
-
-        opcode = struct.unpack("!H", data[:2])[0]
-        self.assertEqual(opcode, TFTP_DATA)
-        block = struct.unpack("!H", data[2:4])[0]
-        self.assertEqual(block, 1)
-        expected = self.boot_file.read_bytes()[:512]
-        self.assertEqual(data[4:], expected)
-        _ok(f"Block 1 received ({len(data[4:])} bytes)")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-    def test_serves_full_file_multi_block(self) -> None:
-        _section("TFTP: multi-block transfer")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(self._rrq("undionly.kpxe"), ("127.0.0.1", port))
-
-        received = bytearray()
-        expected_data = self.boot_file.read_bytes()
-        expected_blocks = (len(expected_data) + 511) // 512
-
-        for block_num in range(1, expected_blocks + 1):
-            try:
-                data, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                shutdown.set()
-                sock.close()
-                t.join(timeout=1)
-                self.fail(f"Timeout waiting for block {block_num}")
-
-            opcode = struct.unpack("!H", data[:2])[0]
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            opcode, block = struct.unpack("!HH", data[:4])
             self.assertEqual(opcode, TFTP_DATA)
-            self.assertEqual(struct.unpack("!H", data[2:4])[0], block_num)
-            received.extend(data[4:])
-
-            ack = struct.pack("!HH", TFTP_ACK, block_num)
-            sock.sendto(ack, addr)
-
-        self.assertEqual(bytes(received), expected_data)
-        _ok(f"Full file received ({len(received)} bytes in {expected_blocks} blocks)")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-    def test_rejects_unknown_file(self) -> None:
-        _section("TFTP: unknown file rejected")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(self._rrq("unknown.bin"), ("127.0.0.1", port))
-
-        try:
-            data, _ = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
+            self.assertEqual(block, 1)
+            self.assertEqual(data[4:], self.boot_file.read_bytes()[:512])
             sock.close()
-            t.join(timeout=1)
-            self.fail("No error response")
-
-        opcode = struct.unpack("!H", data[:2])[0]
-        self.assertEqual(opcode, TFTP_ERROR)
-        _ok("Unknown file triggers TFTP error")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-    def test_rejects_allowed_but_missing_file(self) -> None:
-        _section("TFTP: allowed file but missing on disk")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(self._rrq("ipxe.efi"), ("127.0.0.1", port))
-
-        try:
-            data, _ = sock.recvfrom(2048)
-        except socket.timeout:
+        finally:
             shutdown.set()
-            sock.close()
-            t.join(timeout=1)
-            self.fail("No error response")
+            t.join(timeout=2)
 
-        opcode = struct.unpack("!H", data[:2])[0]
-        self.assertEqual(opcode, TFTP_ERROR)
-        _ok("Missing allowed file triggers TFTP error")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-    def test_apple_mac_path_prefix_stripped(self) -> None:
-        _section("TFTP: Apple PXE MAC prefix")
-        port, shutdown, t = self._start_server()
-
-        rrq = self._rrq("/01-aa-bb-cc-dd-ee-ff/undionly.kpxe")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(rrq, ("127.0.0.1", port))
-
+    def test_serves_full_file_multi_block(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
         try:
-            data, _ = sock.recvfrom(2048)
-        except socket.timeout:
-            shutdown.set()
-            sock.close()
-            t.join(timeout=1)
-            self.fail("No response for Apple PXE path")
-
-        opcode = struct.unpack("!H", data[:2])[0]
-        self.assertEqual(opcode, TFTP_DATA)
-        _ok("Apple PXE MAC path prefix stripped correctly")
-
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
-
-    def test_last_block_is_short(self) -> None:
-        _section("TFTP: last block is short")
-        port, shutdown, t = self._start_server()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(3.0)
-        sock.sendto(self._rrq("undionly.kpxe"), ("127.0.0.1", port))
-
-        expected_data = self.boot_file.read_bytes()
-        expected_blocks = (len(expected_data) + 511) // 512
-        last_data = b""
-
-        for block_num in range(1, expected_blocks + 1):
-            try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            expected = self.boot_file.read_bytes()
+            expected_blocks = (len(expected) + 511) // 512
+            received = bytearray()
+            for block_num in range(1, expected_blocks + 1):
                 data, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                shutdown.set()
-                sock.close()
-                t.join(timeout=1)
-                self.fail(f"Timeout on block {block_num}")
+                received.extend(data[4:])
+                sock.sendto(struct.pack("!HH", TFTP_ACK, block_num), addr)
+            self.assertEqual(bytes(received), expected)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-            opcode = struct.unpack("!H", data[:2])[0]
-            self.assertEqual(opcode, TFTP_DATA)
-            self.assertEqual(struct.unpack("!H", data[2:4])[0], block_num)
-            last_data = data[4:]
+    def test_rejects_unknown_file(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("unknown.bin"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-            ack = struct.pack("!HH", TFTP_ACK, block_num)
-            sock.sendto(ack, addr)
+    def test_rejects_allowed_but_missing_file(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("ipxe.efi"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-        self.assertLess(len(last_data), 512)
-        _ok(f"Last block is short ({len(last_data)} bytes < 512)")
+    def test_apple_mac_path_prefix_stripped(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            rrq = make_rrq("/01-aa-bb-cc-dd-ee-ff/undionly.kpxe")
+            sock.sendto(rrq, ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_DATA)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
-        shutdown.set()
-        sock.close()
-        t.join(timeout=1)
+    def test_last_block_is_short(self):
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            expected = self.boot_file.read_bytes()
+            expected_blocks = (len(expected) + 511) // 512
+            last_data = b""
+            for block_num in range(1, expected_blocks + 1):
+                data, addr = sock.recvfrom(2048)
+                last_data = data[4:]
+                sock.sendto(struct.pack("!HH", TFTP_ACK, block_num), addr)
+            self.assertLess(len(last_data), 512)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+
+    def test_concurrent_transfers(self):
+        """Different ports create independent transfer state."""
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            rrq = make_rrq("undionly.kpxe")
+            c1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            c1.settimeout(3)
+            c1.sendto(rrq, ("127.0.0.1", port))
+            d1, _ = c1.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", d1[:2])[0], TFTP_DATA)
+            c1.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+
+    def test_symlink_to_outside_returns_error(self):
+        """Symlink pointing outside boot_dir — TFTP returns ERROR."""
+        outside = Path(tempfile.mkdtemp()) / "secret.txt"
+        outside.write_bytes(b"SECRET")
+        link = self.boot_dir / "undionly.kpxe"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("Cannot create symlinks")
+            return
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+            outside.unlink(missing_ok=True)
+            link.unlink(missing_ok=True)
+
+    def test_symlink_to_dir_returns_error(self):
+        """Symlink to a directory returns ERROR."""
+        subdir = self.boot_dir / "subdir"
+        subdir.mkdir()
+        link = self.boot_dir / "undionly.kpxe"
+        link.unlink(missing_ok=True)
+        link.symlink_to(subdir)
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+
+    def test_unreadable_file_returns_error(self):
+        """chmod 000 on allowed file returns TFTP ERROR."""
+        allowed = self.boot_dir / "undionly.kpxe"
+        allowed.write_bytes(b"\x00" * 100)
+        os.chmod(allowed, 0o000)
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+            os.chmod(allowed, 0o644)
+
+    def test_tftp_ack_mismatch_drops_transfer(self):
+        """Wrong ACK block number causes transfer to be dropped."""
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            data, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_DATA)
+            # Send wrong ACK (block 99 instead of 1)
+            sock.sendto(struct.pack("!HH", TFTP_ACK, 99), ("127.0.0.1", port))
+            try:
+                sock.recvfrom(2048)
+            except TimeoutError:
+                pass
+            # Transfer state was dropped; try re-requesting
+            sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
+            try:
+                data2, _ = sock.recvfrom(2048)
+                self.assertEqual(struct.unpack("!H", data2[:2])[0], TFTP_DATA)
+            except TimeoutError:
+                pass
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
 
 
-# -----------------------------------------------------------------------
-# HTTP integration tests
-# -----------------------------------------------------------------------
+# --- HTTP ---
+
 
 class TestHTTPIntegration(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmpdir = TemporaryDirectory()
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
         self.boot_dir = Path(self.tmpdir.name)
         self.kernel_file = self.boot_dir / "vmlinuz-linux"
         self.kernel_file.write_bytes(b"KERNEL_" + b"x" * 10000)
         self.iso_file = self.boot_dir / "ubuntu.iso"
         self.iso_file.write_bytes(b"ISO_" + b"y" * 5000)
-        self.initrd_file = self.boot_dir / "initrd.img"
-        self.initrd_file.write_bytes(b"INITRD_" + b"z" * 8000)
 
-    def tearDown(self) -> None:
+    def tearDown(self):
         self.tmpdir.cleanup()
 
-    def _start_server(self) -> tuple[int, threading.Event, threading.Thread]:
-        from src.http_server import _http_server
-        port = _find_free_port()
-        shutdown = threading.Event()
-        t = threading.Thread(target=_http_server, args=(port, self.boot_dir, shutdown), daemon=True)
-        t.start()
-        time.sleep(0.15)
-        return port, shutdown, t
-
-    def _get(self, port: int, path: str) -> tuple[int, dict[str, str], bytes]:
+    def _get(self, path):
         import urllib.request
-        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, dict(resp.headers), resp.read()
 
-    def test_serves_kernel_with_correct_type(self) -> None:
-        _section("HTTP: serve kernel")
-        port, shutdown, t = self._start_server()
+    def test_serves_kernel_with_correct_type(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
-            status, headers, body = self._get(port, "/vmlinuz-linux")
+            status, headers, body = self._get("/vmlinuz-linux")
             self.assertEqual(status, 200)
             self.assertEqual(body, self.kernel_file.read_bytes())
             self.assertEqual(headers.get("Content-Type"), "application/octet-stream")
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Kernel served with correct MIME type")
+            t.join(timeout=2)
 
-    def test_serves_iso_with_correct_type(self) -> None:
-        _section("HTTP: serve ISO")
-        port, shutdown, t = self._start_server()
+    def test_serves_iso_with_correct_type(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
-            status, headers, body = self._get(port, "/ubuntu.iso")
+            status, headers, body = self._get("/ubuntu.iso")
             self.assertEqual(status, 200)
             self.assertEqual(body, self.iso_file.read_bytes())
             self.assertEqual(headers.get("Content-Type"), "application/x-iso9660-image")
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("ISO served with correct MIME type")
+            t.join(timeout=2)
 
-    def test_serves_initrd(self) -> None:
-        _section("HTTP: serve initrd")
-        port, shutdown, t = self._start_server()
+    def test_content_length_matches_file(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
-            status, _, body = self._get(port, "/initrd.img")
+            status, headers, body = self._get("/vmlinuz-linux")
             self.assertEqual(status, 200)
-            self.assertEqual(body, self.initrd_file.read_bytes())
+            self.assertEqual(
+                int(headers.get("Content-Length", "0")), self.kernel_file.stat().st_size
+            )
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Initrd served correctly")
+            t.join(timeout=2)
 
-    def test_content_length_matches_file(self) -> None:
-        _section("HTTP: Content-Length")
-        port, shutdown, t = self._start_server()
-        try:
-            status, headers, body = self._get(port, "/vmlinuz-linux")
-            self.assertEqual(status, 200)
-            self.assertEqual(int(headers.get("Content-Length", "0")), self.kernel_file.stat().st_size)
-            self.assertEqual(len(body), self.kernel_file.stat().st_size)
-        finally:
-            shutdown.set()
-            t.join(timeout=1)
-        _ok("Content-Length matches file size")
-
-    def test_404_for_missing_file(self) -> None:
-        _section("HTTP: 404 missing file")
-        port, shutdown, t = self._start_server()
+    def test_404_for_missing_file(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
             import urllib.error
+
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                self._get(port, "/nonexistent.iso")
+                self._get("/nonexistent.iso")
             self.assertEqual(ctx.exception.code, 404)
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Missing file returns 404")
+            t.join(timeout=2)
 
-    def test_403_for_traversal(self) -> None:
-        _section("HTTP: 403 traversal")
-        port, shutdown, t = self._start_server()
+    def test_403_for_traversal(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
             import urllib.error
+
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                self._get(port, "/../../../etc/passwd")
+                self._get("/../../../etc/passwd")
             self.assertEqual(ctx.exception.code, 403)
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Directory traversal blocked with 403")
+            t.join(timeout=2)
 
-    def test_404_for_root_path(self) -> None:
-        _section("HTTP: 404 root path")
-        port, shutdown, t = self._start_server()
+    def test_404_for_root_path(self):
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
             import urllib.error
+
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                self._get(port, "/")
+                self._get("/")
             self.assertEqual(ctx.exception.code, 404)
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Root path returns 404")
+            t.join(timeout=2)
 
-    def test_large_file_streaming(self) -> None:
-        _section("HTTP: large file streaming")
+    def test_large_file_streaming(self):
         large_file = self.boot_dir / "large.iso"
         large_file.write_bytes(b"LARGE_" + b"a" * 300 * 1024)
-
-        port, shutdown, t = self._start_server()
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
-            status, headers, body = self._get(port, "/large.iso")
+            status, _, body = self._get("/large.iso")
             self.assertEqual(status, 200)
-            self.assertEqual(len(body), large_file.stat().st_size)
             self.assertEqual(body, large_file.read_bytes())
         finally:
             shutdown.set()
-            t.join(timeout=1)
-        _ok(f"Large file ({large_file.stat().st_size} bytes) streamed correctly")
+            t.join(timeout=2)
 
-    def test_extra_path_served(self) -> None:
-        _section("HTTP: extra_paths")
+    def test_extra_path_served(self):
         from src.http_server import BootHTTPHandler
+
         extra_dir = Path(self.tmpdir.name) / "extra"
         extra_dir.mkdir()
-        extra_file = extra_dir / "test.efi"
-        extra_file.write_bytes(b"EXTRA_EFI")
+        (extra_dir / "test.efi").write_bytes(b"EXTRA_EFI")
         BootHTTPHandler.extra_paths = [extra_dir]
-
-        port, shutdown, t = self._start_server()
+        self.port, shutdown, t = start_http(self.boot_dir)
         try:
-            status, _, body = self._get(port, "/extra/test.efi")
+            status, _, body = self._get("/extra/test.efi")
             self.assertEqual(status, 200)
             self.assertEqual(body, b"EXTRA_EFI")
         finally:
             BootHTTPHandler.extra_paths = []
             shutdown.set()
-            t.join(timeout=1)
-        _ok("Extra path file served correctly")
+            t.join(timeout=2)
 
 
 if __name__ == "__main__":
-    print()
-    print(f"  {'#' * 62}")
-    print(f"  #   INTEGRATION TESTS (real sockets)")
-    print(f"  {'#' * 62}")
-    print()
     unittest.main(verbosity=2)

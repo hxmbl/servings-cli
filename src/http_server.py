@@ -1,29 +1,39 @@
 """HTTP server — streams boot payloads (kernel, initrd, ISOs) to iPXE clients."""
 
-import socket, threading, traceback
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
+import threading
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-
+from urllib.parse import unquote
 
 CHUNK_SIZE = 256 * 1024
 
 
 class ReusableHTTPServer(HTTPServer):
-    """HTTPServer with SO_REUSEADDR + SO_REUSEPORT set before bind.
-    
+    """HTTPServer with SO_REUSEADDR set before bind.
+
     Prevents 'Address already in use' errors after crashes.
+    Skips HTTPServer.server_bind()'s socket.getfqdn() call which
+    does a reverse DNS lookup that can hang for seconds on 0.0.0.0.
     """
+
     allow_reuse_address = True
-    allow_reuse_port = True
+    allow_reuse_port = False
 
     def server_bind(self) -> None:
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-        super().server_bind()
+        if self.allow_reuse_port and hasattr(socket, "SO_REUSEPORT"):
+            if self.address_family in (socket.AF_INET, socket.AF_INET6):
+                try:
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
 
 MIME_TYPES = {
     ".kernel": "application/octet-stream",
@@ -48,12 +58,16 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
     extra_paths: list[Path] = []
 
     def do_GET(self) -> None:
-        path = self.path.lstrip("/")
+        path = unquote(self.path.lstrip("/"))
         if not path:
             self.send_error(404)
             return
 
-        full_path = (self.boot_root / path).resolve()
+        try:
+            full_path = (self.boot_root / path).resolve()
+        except (ValueError, OSError):
+            self.send_error(404)
+            return
         boot_root_resolved = self.boot_root.resolve()
         allowed = str(full_path).startswith(str(boot_root_resolved))
         if not allowed:
@@ -66,7 +80,13 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
 
-        if not full_path.exists() or full_path.is_dir():
+        try:
+            is_dir = full_path.is_dir()
+            exists = full_path.exists()
+        except OSError:
+            self.send_error(404)
+            return
+        if not exists or is_dir:
             self.send_error(404)
             return
 
@@ -95,6 +115,7 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
 
 def _http_server(port: int, boot_root: Path, shutdown: threading.Event) -> None:
     """Start the HTTP file server."""
+    server = None
     try:
         BootHTTPHandler.boot_root = boot_root
         server = ReusableHTTPServer(("0.0.0.0", port), BootHTTPHandler)
@@ -104,3 +125,6 @@ def _http_server(port: int, boot_root: Path, shutdown: threading.Event) -> None:
             server.handle_request()
     except Exception:
         traceback.print_exc()
+    finally:
+        if server:
+            server.server_close()

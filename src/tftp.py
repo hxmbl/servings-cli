@@ -15,17 +15,23 @@ import struct
 import threading
 from pathlib import Path
 
+TFTP_RRQ = 1  # Read Request — client asks for a file
+TFTP_DATA = 3  # Data block — server sends a chunk
+TFTP_ACK = 4  # Acknowledgment — client confirms receipt
+TFTP_ERROR = 5  # Error — something went wrong
+TFTP_BLOCK_SIZE = 512  # Standard TFTP block size (bytes per packet)
 
-TFTP_RRQ = 1          # Read Request — client asks for a file
-TFTP_DATA = 3         # Data block — server sends a chunk
-TFTP_ACK = 4          # Acknowledgment — client confirms receipt
-TFTP_ERROR = 5        # Error — something went wrong
-TFTP_BLOCK_SIZE = 512 # Standard TFTP block size (bytes per packet)
-
-ALLOWED_BOOT_FILES = frozenset({
-    b"undionly.kpxe", b"ipxe.efi", b"snponly.efi", b"snp.efi",
-    b"ipxe.efi.signed", b"bootx64.efi", b"grubx64.efi",
-})
+ALLOWED_BOOT_FILES = frozenset(
+    {
+        b"undionly.kpxe",
+        b"ipxe.efi",
+        b"snponly.efi",
+        b"snp.efi",
+        b"ipxe.efi.signed",
+        b"bootx64.efi",
+        b"grubx64.efi",
+    }
+)
 
 
 def parse_tftp_rrq(data: bytes) -> str | None:
@@ -46,10 +52,12 @@ def parse_tftp_rrq(data: bytes) -> str | None:
     return data[2:null_pos].decode("ascii", errors="replace")
 
 
-def _tftp_send_next_block(sock: socket.socket, addr: tuple[str, int], state: dict) -> bool:
+def _tftp_send_next_block(
+    sock: socket.socket, addr: tuple[str, int], state: dict
+) -> bool:
     """Send next DATA block for an active transfer. Returns True if transfer is complete (last block)."""
     file_data = state["file_data"]
-    block_num = state["block_num"] + 1
+    block_num = (state["block_num"] + 1) & 0xFFFF
     offset = state["offset"]
 
     chunk = file_data[offset : offset + TFTP_BLOCK_SIZE]
@@ -112,24 +120,34 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                     bare_name = Path(filename).name
                     bare_bytes = bare_name.encode("ascii")
                     if bare_bytes not in ALLOWED_BOOT_FILES:
-                        print(f"[!] TFTP: rejecting unknown file '{filename}' from {addr}")
-                        error_pkt = struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
+                        print(
+                            f"[!] TFTP: rejecting unknown file '{filename}' from {addr}"
+                        )
+                        error_pkt = (
+                            struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
+                        )
                         sock.sendto(error_pkt, addr)
                         continue
 
                     file_path = boot_dir / bare_name
                     if not file_path.exists():
                         print(f"[!] TFTP: {bare_name} not found at {file_path}")
-                        error_pkt = struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
+                        error_pkt = (
+                            struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
+                        )
                         sock.sendto(error_pkt, addr)
                         continue
 
-                    print(f"[+] TFTP: serving {bare_name} to {addr} (requested: {filename})")
+                    print(
+                        f"[+] TFTP: serving {bare_name} to {addr} (requested: {filename})"
+                    )
                     try:
                         file_data = file_path.read_bytes()
                     except OSError as e:
                         print(f"[!] TFTP: failed to read {file_path.name}: {e}")
-                        error_pkt = struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
+                        error_pkt = (
+                            struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
+                        )
                         sock.sendto(error_pkt, addr)
                         continue
 

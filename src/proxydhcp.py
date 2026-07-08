@@ -7,7 +7,6 @@ Root mode (port 67): replaces the existing DHCP server entirely (see dhcp_server
 """
 
 import socket
-import struct
 import threading
 
 
@@ -60,7 +59,9 @@ def parse_packet(data: bytes, addr: tuple[str, int]) -> dict[str, object] | None
     # Arch 0 = BIOS, 6/7/8/9 = EFI variants
     boot_file = _detect_boot_file(vendor_class)
 
-    print(f"[+] PXE request from {mac_readable} (TxID={transaction_id.hex()}) → {boot_file}")
+    print(
+        f"[+] PXE request from {mac_readable} (TxID={transaction_id.hex()}) → {boot_file}"
+    )
     return {
         "client_address": addr,
         "transaction_id": transaction_id,
@@ -105,10 +106,10 @@ def send_proxy_reply(sock: socket.socket, client_info: dict[str, object]) -> Non
     packet = bytearray(240)
 
     # BOOTP header
-    packet[0] = 2        # BOOTREPLY
-    packet[1] = 1        # htype: ethernet
-    packet[2] = 6        # hlen: MAC length
-    packet[3] = 0        # hops
+    packet[0] = 2  # BOOTREPLY
+    packet[1] = 1  # htype: ethernet
+    packet[2] = 6  # hlen: MAC length
+    packet[3] = 0  # hops
 
     packet[4:8] = client_info["transaction_id"]
     packet[28:34] = client_info["mac_raw"]
@@ -117,17 +118,20 @@ def send_proxy_reply(sock: socket.socket, client_info: dict[str, object]) -> Non
     packet[236:240] = b"\x63\x82\x53\x63"
 
     # DHCP options — what the PXE client needs to find the boot file
-    packet += b"\x35\x01\x05"          # option 53: DHCPACK
+    packet += b"\x35\x01\x05"  # option 53: DHCPACK
     packet += b"\x36\x04" + socket.inet_aton(server_ip)  # option 54: server identifier
-    packet += b"\x3c\x09PXEClient"     # option 60: vendor class (marks this as PXE)
+    packet += b"\x3c\x09PXEClient"  # option 60: vendor class (marks this as PXE)
     packet += b"\x42\x04" + socket.inet_aton(server_ip)  # option 66: TFTP server IP
     boot_file = (client_info["boot_file"] + "\x00").encode()
     packet += b"\x43" + bytes([len(boot_file)]) + boot_file  # option 67: boot file name
-    packet += b"\xff"                   # end marker
+    packet += b"\xff"  # end marker
 
     # Reply to the actual source port — not hardcoded 68
     # PXE clients may send from ephemeral ports
-    target_address = (client_info["client_address"][0], client_info["client_address"][1])
+    target_address = (
+        client_info["client_address"][0],
+        client_info["client_address"][1],
+    )
     sock.sendto(packet, target_address)
     print(f"[+] Sent {len(packet)} bytes to {target_address}")
 
@@ -148,7 +152,7 @@ def _proxydhcp_listener(port: int, shutdown: threading.Event) -> None:
         while not shutdown.is_set():
             try:
                 data, addr = s.recvfrom(2048)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             client_info = parse_packet(data, addr)
             if client_info:

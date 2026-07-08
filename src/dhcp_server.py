@@ -8,10 +8,8 @@ Non-root mode is handled by proxydhcp.py on port 4011 instead.
 """
 
 import socket
-import struct
 import threading
 from dataclasses import dataclass, field
-
 
 # DHCP message types
 DHCP_DISCOVER = 1
@@ -39,6 +37,7 @@ MAGIC_COOKIE = b"\x63\x82\x53\x63"
 @dataclass
 class IPPool:
     """Simple IP pool — assigns addresses from a /24 subnet."""
+
     subnet: str = "192.168.42"
     next_ip: int = 100
     max_ip: int = 200
@@ -124,15 +123,15 @@ def _build_bootp_packet(
     pkt = bytearray(240)
 
     # BOOTP header — most fields mirror the request
-    pkt[0] = 2                        # op: BOOTREPLY
-    pkt[1] = 1                        # htype: ethernet
-    pkt[2] = 6                        # hlen: MAC is 6 bytes
-    pkt[3] = 0                        # hops
-    pkt[4:8] = request["xid"]        # xid: transaction ID (client matches on this)
-    pkt[16:20] = socket.inet_aton(ip)          # yiaddr: "your" IP
-    pkt[20:24] = socket.inet_aton(server_ip)   # siaddr: server IP (TFTP server)
-    pkt[24:28] = socket.inet_aton(server_ip)   # giaddr: gateway (same for direct)
-    pkt[28:34] = request["mac"]      # chaddr: client MAC
+    pkt[0] = 2  # op: BOOTREPLY
+    pkt[1] = 1  # htype: ethernet
+    pkt[2] = 6  # hlen: MAC is 6 bytes
+    pkt[3] = 0  # hops
+    pkt[4:8] = request["xid"]  # xid: transaction ID (client matches on this)
+    pkt[16:20] = socket.inet_aton(ip)  # yiaddr: "your" IP
+    pkt[20:24] = socket.inet_aton(server_ip)  # siaddr: server IP (TFTP server)
+    pkt[24:28] = socket.inet_aton(server_ip)  # giaddr: gateway (same for direct)
+    pkt[28:34] = request["mac"]  # chaddr: client MAC
     pkt[236:240] = MAGIC_COOKIE
 
     # Build subnet for broadcast address
@@ -193,7 +192,7 @@ def dhcp_listener(
         while not shutdown.is_set():
             try:
                 data, addr = s.recvfrom(2048)
-            except socket.timeout:
+            except TimeoutError:
                 continue
 
             request = _parse_dhcp_request(data)
@@ -210,7 +209,9 @@ def dhcp_listener(
 
             if request["msg_type"] == DHCP_DISCOVER:
                 print(f"[+] {tag}: DISCOVER from {mac_str} → offering {ip}")
-                resp = _build_bootp_packet(request, ip, server_ip, DHCP_OFFER, boot_file)
+                resp = _build_bootp_packet(
+                    request, ip, server_ip, DHCP_OFFER, boot_file
+                )
                 s.sendto(resp, dest)
                 print(f"[+] {tag}: OFFER sent {ip} to {mac_str}")
 

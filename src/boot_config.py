@@ -6,10 +6,26 @@ iPXE loads this from the HTTP server (port 8080) after the TFTP stage.
 
 from pathlib import Path
 
-
 _INITRD_EXTENSIONS = frozenset({".initrd", ".img"})
 _INITRD_NAMES = frozenset({"initrd", "initramfs"})
 _IGNORED_NAMES = frozenset({"boot.cfg", ".DS_Store", "undionly.kpxe", "ipxe.efi"})
+_IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".svn",
+        ".hg",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".Trashes",
+        ".vol",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".Spotlight-V100",
+    }
+)
 
 
 def _is_initrd(path: Path) -> bool:
@@ -24,7 +40,7 @@ def _is_initrd(path: Path) -> bool:
 def _is_kernel(path: Path) -> bool:
     """Check if a file looks like a bootable kernel."""
     ext = path.suffix.lower()
-    if ext in (".kernel", ".vmlinuz", ".bzImage", ""):
+    if ext in (".kernel", ".vmlinuz", ".bzImage"):
         return True
     name_lower = path.name.lower()
     if name_lower.startswith("vmlinuz") or name_lower.startswith("bzimage"):
@@ -63,8 +79,15 @@ def generate_boot_config(boot_dir: Path) -> Path:
     # key: lowercase relative path, value: (full Path, relative path string)
     all_files: dict[str, tuple[Path, str]] = {}
     for f in sorted(boot_dir.rglob("*")):
+        rel = f.relative_to(boot_dir)
+        # Skip hidden dirs, venv, pycache, macOS/Windows junk
+        if any(part in _IGNORED_DIRS for part in rel.parts):
+            continue
+        # Skip macOS resource forks (._prefix) and .fseventsd/.visync
+        if f.name.startswith("._") or f.name.startswith("."):
+            continue
         if f.is_file() and f.name not in _IGNORED_NAMES:
-            rel_path = str(f.relative_to(boot_dir))
+            rel_path = str(rel)
             all_files[rel_path.lower()] = (f, rel_path)
 
     def _label_from_relpath(rel_path: str) -> str:
@@ -86,7 +109,7 @@ def generate_boot_config(boot_dir: Path) -> Path:
             base = path.stem.lower()
             for prefix in ("initramfs-", "initrd-"):
                 if base.startswith(prefix):
-                    base = base[len(prefix):]
+                    base = base[len(prefix) :]
                     break
             for suffix in ("-initrd", "-initramfs", "_initrd", "_initramfs"):
                 if base.endswith(suffix):
@@ -103,7 +126,7 @@ def generate_boot_config(boot_dir: Path) -> Path:
             base = path.stem.lower()
             for prefix in ("vmlinuz-", "bzimage-"):
                 if base.startswith(prefix):
-                    base = base[len(prefix):]
+                    base = base[len(prefix) :]
                     break
 
             if base in initrds:
@@ -115,7 +138,12 @@ def generate_boot_config(boot_dir: Path) -> Path:
 
     # Remaining unclaimed .img files become standalone
     for rel_lower, (path, rel_path) in all_files.items():
-        if rel_lower not in claimed and path.suffix.lower() in (".img", ".kernel", ".vmlinuz", ".bzImage"):
+        if rel_lower not in claimed and path.suffix.lower() in (
+            ".img",
+            ".kernel",
+            ".vmlinuz",
+            ".bzImage",
+        ):
             standalone_kernels.append(rel_path)
             claimed.add(rel_lower)
 
@@ -193,5 +221,7 @@ def generate_boot_config(boot_dir: Path) -> Path:
 
     cfg_path = boot_dir / "boot.cfg"
     cfg_path.write_text(script)
-    print(f"[+] Generated boot.cfg ({len(iso_files)} ISOs, {len(kernel_initrd_pairs)} pairs, {len(standalone_kernels)} kernels)")
+    print(
+        f"[+] Generated boot.cfg ({len(iso_files)} ISOs, {len(kernel_initrd_pairs)} pairs, {len(standalone_kernels)} kernels)"
+    )
     return cfg_path

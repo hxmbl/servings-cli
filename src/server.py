@@ -9,10 +9,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from src.boot_config import generate_boot_config
+from src.http_server import _http_server
 from src.proxydhcp import _proxydhcp_listener
 from src.tftp import _tftp_listener
-from src.http_server import _http_server
-from src.boot_config import generate_boot_config
 
 
 def _check_root() -> None:
@@ -67,7 +67,7 @@ def serve(
     print(f"  Boot file : {boot_file}")
     print(f"  Server IP : {server_ip}")
     if android:
-        print(f"  Platform  : Android/Termux")
+        print("  Platform  : Android/Termux")
     print("=" * 55)
     print()
 
@@ -81,6 +81,7 @@ def serve(
 
     if root_mode:
         from src.dhcp_server import dhcp_listener
+
         executor.submit(dhcp_listener, dhcp_port, boot_file, shutdown, server_ip)
     else:
         executor.submit(_proxydhcp_listener, dhcp_port, shutdown)
