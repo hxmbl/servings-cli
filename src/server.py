@@ -53,6 +53,7 @@ def serve(
 
     dhcp_port = 67 if root_mode else port
     tftp_actual = 69 if root_mode else tftp_port
+    http_actual = 80 if root_mode else http_port
 
     print()
     print("=" * 55)
@@ -62,7 +63,7 @@ def serve(
     print(f"  MODE      : {mode_label}")
     print(f"  DHCP      : UDP {dhcp_port}")
     print(f"  TFTP      : UDP {tftp_actual}")
-    print(f"  HTTP      : TCP {http_port}")
+    print(f"  HTTP      : TCP {http_actual}")
     print(f"  Boot dir  : {root}")
     print(f"  Boot file : {boot_file}")
     print(f"  Server IP : {server_ip}")
@@ -87,7 +88,7 @@ def serve(
         executor.submit(_proxydhcp_listener, dhcp_port, shutdown)
 
     executor.submit(_tftp_listener, tftp_actual, root, shutdown)
-    executor.submit(_http_server, http_port, root, shutdown)
+    executor.submit(_http_server, http_actual, root, shutdown)
 
     try:
         while not shutdown.is_set():
