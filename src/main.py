@@ -27,8 +27,8 @@ _BOOT_DIR_CANDIDATES = [
 ]
 
 _ANDROID_BOOT_DIR_CANDIDATES = [
-    Path("/sdcard/Disk Images"),
-    Path("/storage/emulated/0/Disk Images"),
+    Path("/sdcard/DiskImages"),
+    Path("/storage/emulated/0/DiskImages"),
 ]
 
 _VENTOY_MARKERS = frozenset({"ventoy", "Ventoy", "VENTOY"})

@@ -72,7 +72,7 @@ Ports: ProxyDHCP on 4011, TFTP on 6969, HTTP on 8080.
 The `--android` flag adds Termux-specific conveniences on top of whatever
 mode you're running in:
 
-- Scans `/sdcard/Disk Images` and `/storage/emulated/0/Disk Images` for boot files
+- Scans `/sdcard/DiskImages` and `/storage/emulated/0/DiskImages` for boot files
 - Auto-detects the USB tethering interface IP (rndis0/usb0)
 - Shows platform info in the server banner
 
@@ -112,7 +112,7 @@ The server looks for boot files in these locations (in order):
 4. `/srv/tftp/`
 5. `/var/lib/tftpboot/`
 6. Current working directory (fallback)
-7. With `--android`: `/sdcard/Disk Images/` and `/storage/emulated/0/Disk Images/`
+7. With `--android`: `/sdcard/DiskImages/` and `/storage/emulated/0/DiskImages/`
 
 ### What goes in it
 
