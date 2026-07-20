@@ -223,8 +223,8 @@ def serve(
         else:
             server_ip = "192.168.42.129"
 
-    # --android implies root (phone has su, ports 67/69 work fine)
-    # Pass --no-root explicitly to use non-root ports 4011/6969
+    if android:
+        no_root = True
 
     resolved = _resolve_boot_dir(boot_dir, android=android)
     _serve(
