@@ -204,7 +204,7 @@ def serve(
     Non-root mode: ProxyDHCP on 4011 + TFTP on 6969.
     Works alongside your existing DHCP server.
 
-    --android implies --no-root automatically.
+    --android: Termux-specific paths + USB IP auto-detection.
 
     Examples:
       sudo servings-cli serve
@@ -222,9 +222,6 @@ def serve(
                 server_ip = "192.168.42.129"
         else:
             server_ip = "192.168.42.129"
-
-    if android:
-        no_root = True
 
     resolved = _resolve_boot_dir(boot_dir, android=android)
     _serve(
