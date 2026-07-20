@@ -240,10 +240,7 @@ def serve(
 
 
 def entry_point() -> None:
-    args = sys.argv[1:]
-    if args and not args[0].startswith("-"):
-        args = args[1:]
-    app(args)
+    app()
 
 
 if __name__ == "__main__":
