@@ -746,7 +746,7 @@ class TestMultipleBootTypes(unittest.TestCase):
                 build_pxe_discover(mac, arch_id=arch_id), ("127.0.0.1", 68)
             )
             mock_sock = MagicMock()
-            send_proxy_reply(mock_sock, result)
+            send_proxy_reply(mock_sock, result, "127.0.0.1")
             sent = mock_sock.sendto.call_args[0][0]
             self.assertEqual(sent[0], 2)
             self.assertEqual(sent[236:240], b"\x63\x82\x53\x63")
@@ -1362,7 +1362,7 @@ class TestSendProxyReply(unittest.TestCase):
             "mac_readable": "aa:bb:cc:dd:ee:ff",
             "boot_file": "undionly.kpxe",
         }
-        send_proxy_reply(mock_sock, info)
+        send_proxy_reply(mock_sock, info, "10.0.0.1")
         data, target = mock_sock.sendto.call_args[0]
         self.assertEqual(target, ("10.0.0.50", 4011))
         self.assertEqual(data[0], 2)
@@ -1377,8 +1377,34 @@ class TestSendProxyReply(unittest.TestCase):
             "mac_readable": "aa:bb:cc:dd:ee:ff",
             "boot_file": "ipxe.efi",
         }
-        send_proxy_reply(mock_sock, info)
+        send_proxy_reply(mock_sock, info, "10.0.0.1")
         self.assertIn(b"ipxe.efi", mock_sock.sendto.call_args[0][0])
+
+    def test_uses_server_ip_not_client_ip(self):
+        mock_sock = MagicMock()
+        info = {
+            "client_address": ("10.0.0.50", 4011),
+            "transaction_id": b"\x01\x02\x03\x04",
+            "mac_raw": b"\xaa\xbb\xcc\xdd\xee\xff",
+            "mac_readable": "aa:bb:cc:dd:ee:ff",
+            "boot_file": "undionly.kpxe",
+        }
+        send_proxy_reply(mock_sock, info, "10.0.0.1")
+        data, _ = mock_sock.sendto.call_args[0]
+        opts = data[240:]
+        tftp_ip = None
+        i = 0
+        while i < len(opts):
+            tag = opts[i]
+            if tag == 255:
+                break
+            if i + 1 >= len(opts):
+                break
+            length = opts[i + 1]
+            if tag == 66:
+                tftp_ip = opts[i + 2 : i + 2 + length]
+            i += 2 + length
+        self.assertEqual(tftp_ip, socket.inet_aton("10.0.0.1"))
 
 
 # --- Extra Paths in HTTP ---

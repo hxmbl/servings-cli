@@ -111,7 +111,7 @@ def serve(
 
         executor.submit(dhcp_listener, dhcp_port, boot_file, shutdown, server_ip)
     else:
-        executor.submit(_proxydhcp_listener, dhcp_port, shutdown)
+        executor.submit(_proxydhcp_listener, dhcp_port, shutdown, server_ip)
 
     executor.submit(_tftp_listener, tftp_actual, root, shutdown)
     executor.submit(_http_server, http_actual, root, shutdown)

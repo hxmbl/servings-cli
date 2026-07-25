@@ -116,7 +116,7 @@ class TestTsharkProxyDHCP(unittest.TestCase):
         port = free_udp_port()
         shutdown = threading.Event()
         t = threading.Thread(
-            target=_proxydhcp_listener, args=(port, shutdown), daemon=True
+            target=_proxydhcp_listener, args=(port, shutdown, "127.0.0.1"), daemon=True
         )
         t.start()
         time.sleep(0.15)

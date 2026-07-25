@@ -131,13 +131,15 @@ def start_http(boot_dir: Path) -> tuple[int, threading.Event, threading.Thread]:
     return port, shutdown, t
 
 
-def start_proxydhcp() -> tuple[int, threading.Event, threading.Thread]:
+def start_proxydhcp(
+    server_ip: str = "127.0.0.1",
+) -> tuple[int, threading.Event, threading.Thread]:
     """Start a ProxyDHCP listener on a free port and return (port, shutdown_event, thread)."""
     from src.proxydhcp import _proxydhcp_listener
 
     shutdown = threading.Event()
     port = free_udp_port()
-    t = threading.Thread(target=_proxydhcp_listener, args=(port, shutdown))
+    t = threading.Thread(target=_proxydhcp_listener, args=(port, shutdown, server_ip))
     t.daemon = True
     t.start()
     time.sleep(0.15)

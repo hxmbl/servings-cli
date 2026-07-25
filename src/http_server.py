@@ -69,11 +69,18 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         boot_root_resolved = self.boot_root.resolve()
-        allowed = str(full_path).startswith(str(boot_root_resolved))
+        boot_root_str = str(boot_root_resolved)
+        full_path_str = str(full_path)
+        allowed = full_path_str == boot_root_str or full_path_str.startswith(
+            boot_root_str + "/"
+        )
         if not allowed:
             for extra in self.extra_paths:
                 extra_resolved = extra.resolve()
-                if str(full_path).startswith(str(extra_resolved)):
+                extra_str = str(extra_resolved)
+                if full_path_str == extra_str or full_path_str.startswith(
+                    extra_str + "/"
+                ):
                     allowed = True
                     break
         if not allowed:

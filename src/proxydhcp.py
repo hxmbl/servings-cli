@@ -92,16 +92,15 @@ def _detect_boot_file(vendor_class: bytes) -> str:
     return "undionly.kpxe"
 
 
-def send_proxy_reply(sock: socket.socket, client_info: dict[str, object]) -> None:
+def send_proxy_reply(
+    sock: socket.socket, client_info: dict[str, object], server_ip: str
+) -> None:
     """Build and send a ProxyDHCP reply with boot file info.
 
     Only sends the PXE options (54, 60, 66, 67) — the IP was already assigned
     by Android's DHCP server. This is ProxyDHCP, not full DHCP.
     """
     print(f"[*] Replying to {client_info['mac_readable']}...")
-
-    # TFTP server IP — the phone's IP on the client's network
-    server_ip = client_info["client_address"][0]
 
     packet = bytearray(240)
 
@@ -136,7 +135,9 @@ def send_proxy_reply(sock: socket.socket, client_info: dict[str, object]) -> Non
     print(f"[+] Sent {len(packet)} bytes to {target_address}")
 
 
-def _proxydhcp_listener(port: int, shutdown: threading.Event) -> None:
+def _proxydhcp_listener(
+    port: int, shutdown: threading.Event, server_ip: str = "192.168.42.129"
+) -> None:
     """UDP listener for ProxyDHCP requests on non-root (port 4011).
 
     Works alongside an existing DHCP server. The ProxyDHCP only adds PXE
@@ -156,4 +157,4 @@ def _proxydhcp_listener(port: int, shutdown: threading.Event) -> None:
                 continue
             client_info = parse_packet(data, addr)
             if client_info:
-                send_proxy_reply(s, client_info)
+                send_proxy_reply(s, client_info, server_ip)
