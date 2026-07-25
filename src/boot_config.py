@@ -219,7 +219,7 @@ def generate_boot_config(boot_dir: Path) -> Path:
     script += "goto menu\n"
 
     cfg_path = boot_dir / "boot.cfg"
-    cfg_path.write_text(script)
+    cfg_path.write_text(script, encoding="utf-8")
     print(
         f"[+] Generated boot.cfg ({len(iso_files)} ISOs, {len(kernel_initrd_pairs)} pairs, {len(standalone_kernels)} kernels)"
     )

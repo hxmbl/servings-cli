@@ -130,7 +130,7 @@ def _build_bootp_packet(
     pkt[4:8] = request["xid"]  # xid: transaction ID (client matches on this)
     pkt[16:20] = socket.inet_aton(ip)  # yiaddr: "your" IP
     pkt[20:24] = socket.inet_aton(server_ip)  # siaddr: server IP (TFTP server)
-    pkt[24:28] = socket.inet_aton(server_ip)  # giaddr: gateway (same for direct)
+    pkt[24:28] = socket.inet_aton("0.0.0.0")  # giaddr: 0 for direct (no relay)
     pkt[28:34] = request["mac"]  # chaddr: client MAC
     pkt[236:240] = MAGIC_COOKIE
 

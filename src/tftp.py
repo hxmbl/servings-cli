@@ -13,6 +13,7 @@ import selectors
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 
 TFTP_RRQ = 1  # Read Request — client asks for a file
@@ -82,76 +83,107 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
 
     print(f"[*] TFTP listening on UDP {port} (root: {boot_dir})")
 
-    # Active transfers: client_addr -> {file_data: bytes, block_num: int, offset: int}
+    # Active transfers: client_addr -> {file_data: bytes, block_num: int, offset: int, last_active: float}
     transfers: dict[tuple[str, int], dict] = {}
+    TRANSFER_TIMEOUT = 30.0  # seconds
 
-    while not shutdown.is_set():
-        events = sel.select(timeout=1.0)
+    try:
+        while not shutdown.is_set():
+            events = sel.select(timeout=1.0)
+            now = time.time()
 
-        for _key, _mask in events:
-            while True:
-                try:
-                    data, addr = sock.recvfrom(2048)
-                except BlockingIOError:
-                    break
+            # Purge stale transfers
+            stale = [
+                addr
+                for addr, st in transfers.items()
+                if now - st["last_active"] > TRANSFER_TIMEOUT
+            ]
+            for addr in stale:
+                del transfers[addr]
 
-                if addr in transfers:
-                    state = transfers[addr]
-                    if len(data) < 4:
-                        del transfers[addr]
-                        continue
-                    opcode = struct.unpack("!H", data[:2])[0]
-                    if opcode != TFTP_ACK:
-                        del transfers[addr]
-                        continue
-                    ack_block = struct.unpack("!H", data[2:4])[0]
-                    if ack_block != state["block_num"]:
-                        del transfers[addr]
-                        continue
-                    done = _tftp_send_next_block(sock, addr, state)
-                    if done:
-                        del transfers[addr]
-                else:
-                    filename = parse_tftp_rrq(data)
-                    if not filename:
-                        continue
-
-                    # Apple PXE prepends /01-XX-XX-XX-XX-XX-XX/ — strip to basename
-                    bare_name = Path(filename).name
-                    bare_bytes = bare_name.encode("ascii")
-                    if bare_bytes not in ALLOWED_BOOT_FILES:
-                        print(
-                            f"[!] TFTP: rejecting unknown file '{filename}' from {addr}"
-                        )
-                        error_pkt = (
-                            struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
-                        )
-                        sock.sendto(error_pkt, addr)
-                        continue
-
-                    file_path = boot_dir / bare_name
-                    if not file_path.exists():
-                        print(f"[!] TFTP: {bare_name} not found at {file_path}")
-                        error_pkt = (
-                            struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
-                        )
-                        sock.sendto(error_pkt, addr)
-                        continue
-
-                    print(
-                        f"[+] TFTP: serving {bare_name} to {addr} (requested: {filename})"
-                    )
+            for _key, _mask in events:
+                while True:
                     try:
-                        file_data = file_path.read_bytes()
-                    except OSError as e:
-                        print(f"[!] TFTP: failed to read {file_path.name}: {e}")
-                        error_pkt = (
-                            struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
-                        )
-                        sock.sendto(error_pkt, addr)
-                        continue
+                        data, addr = sock.recvfrom(2048)
+                    except BlockingIOError:
+                        break
 
-                    state: dict = {"file_data": file_data, "block_num": 0, "offset": 0}
-                    done = _tftp_send_next_block(sock, addr, state)
-                    if not done:
-                        transfers[addr] = state
+                    if addr in transfers:
+                        state = transfers[addr]
+                        state["last_active"] = now
+                        if len(data) < 4:
+                            del transfers[addr]
+                            continue
+                        opcode = struct.unpack("!H", data[:2])[0]
+                        if opcode != TFTP_ACK:
+                            del transfers[addr]
+                            continue
+                        ack_block = struct.unpack("!H", data[2:4])[0]
+                        if ack_block != state["block_num"]:
+                            del transfers[addr]
+                            continue
+                        done = _tftp_send_next_block(sock, addr, state)
+                        if done:
+                            del transfers[addr]
+                    else:
+                        filename = parse_tftp_rrq(data)
+                        if not filename:
+                            continue
+
+                        # Apple PXE prepends /01-XX-XX-XX-XX-XX-XX/ — strip to basename
+                        bare_name = Path(filename).name
+                        try:
+                            bare_bytes = bare_name.encode("ascii")
+                        except UnicodeEncodeError:
+                            print(f"[!] TFTP: rejecting non-ASCII filename from {addr}")
+                            error_pkt = (
+                                struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
+                            )
+                            sock.sendto(error_pkt, addr)
+                            continue
+                        if bare_bytes not in ALLOWED_BOOT_FILES:
+                            print(
+                                f"[!] TFTP: rejecting unknown file '{filename}' from {addr}"
+                            )
+                            error_pkt = (
+                                struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
+                            )
+                            sock.sendto(error_pkt, addr)
+                            continue
+
+                        file_path = boot_dir / bare_name
+                        if not file_path.exists():
+                            print(f"[!] TFTP: {bare_name} not found at {file_path}")
+                            error_pkt = (
+                                struct.pack("!HH", TFTP_ERROR, 1)
+                                + b"File not found\x00"
+                            )
+                            sock.sendto(error_pkt, addr)
+                            continue
+
+                        print(
+                            f"[+] TFTP: serving {bare_name} to {addr} (requested: {filename})"
+                        )
+                        try:
+                            file_data = file_path.read_bytes()
+                        except OSError as e:
+                            print(f"[!] TFTP: failed to read {file_path.name}: {e}")
+                            error_pkt = (
+                                struct.pack("!HH", TFTP_ERROR, 1)
+                                + b"File not found\x00"
+                            )
+                            sock.sendto(error_pkt, addr)
+                            continue
+
+                        state: dict = {
+                            "file_data": file_data,
+                            "block_num": 0,
+                            "offset": 0,
+                            "last_active": time.time(),
+                        }
+                        done = _tftp_send_next_block(sock, addr, state)
+                        if not done:
+                            transfers[addr] = state
+    finally:
+        sel.close()
+        sock.close()

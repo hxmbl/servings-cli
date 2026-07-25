@@ -7,6 +7,7 @@ Non-root mode: ProxyDHCP on 4011 + TFTP on 6969 (no privileges needed).
 import os
 import subprocess
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -51,6 +52,18 @@ def _check_root() -> None:
             print()
     except AttributeError:
         pass
+
+
+def _monitor_futures(futures: dict, shutdown: threading.Event) -> None:
+    """Periodically check server futures for unexpected deaths."""
+    while not shutdown.is_set():
+        shutdown.wait(5)
+        for name, future in futures.items():
+            if future.done():
+                exc = future.exception()
+                if exc is not None:
+                    print(f"[!] {name} server CRASHED: {exc}")
+                    traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 def serve(
@@ -106,15 +119,26 @@ def serve(
     shutdown = threading.Event()
     executor = ThreadPoolExecutor(max_workers=6)
 
+    futures: dict = {}
+
     if root_mode:
         from src.dhcp_server import dhcp_listener
 
-        executor.submit(dhcp_listener, dhcp_port, boot_file, shutdown, server_ip)
+        futures["DHCP"] = executor.submit(
+            dhcp_listener, dhcp_port, boot_file, shutdown, server_ip
+        )
     else:
-        executor.submit(_proxydhcp_listener, dhcp_port, shutdown, server_ip)
+        futures["ProxyDHCP"] = executor.submit(
+            _proxydhcp_listener, dhcp_port, shutdown, server_ip
+        )
 
-    executor.submit(_tftp_listener, tftp_actual, root, shutdown)
-    executor.submit(_http_server, http_actual, root, shutdown)
+    futures["TFTP"] = executor.submit(_tftp_listener, tftp_actual, root, shutdown)
+    futures["HTTP"] = executor.submit(_http_server, http_actual, root, shutdown)
+
+    monitor = threading.Thread(
+        target=_monitor_futures, args=(futures, shutdown), daemon=True
+    )
+    monitor.start()
 
     try:
         while not shutdown.is_set():
