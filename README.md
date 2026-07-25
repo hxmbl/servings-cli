@@ -86,9 +86,9 @@ servings-cli serve --android
 
 # Set up shared storage for boot files:
 termux-setup-storage
-mkdir -p /sdcard/Disk\ Images
-cp archlinux-*.iso /sdcard/Disk\ Images/
-curl -o /sdcard/Disk\ Images/undionly.kpxe https://boot.ipxe.org/undionly.kpxe
+mkdir -p /sdcard/DiskImages
+cp archlinux-*.iso /sdcard/DiskImages/
+curl -o /sdcard/DiskImages/undionly.kpxe https://boot.ipxe.org/undionly.kpxe
 ```
 
 ---
@@ -111,16 +111,26 @@ The server looks for boot files in these locations (in order):
 3. `~/tftp/`
 4. `/srv/tftp/`
 5. `/var/lib/tftpboot/`
-6. Current working directory (fallback)
-7. With `--android`: `/sdcard/DiskImages/` and `/storage/emulated/0/DiskImages/`
+6. USB drives — scans `/mnt/*`, `/media/*`, and `/run/media/*` for mounted removable drives containing `.iso` files or Ventoy markers
+7. Current working directory (fallback)
+8. With `--android`: `/sdcard/DiskImages/` and `/storage/emulated/0/DiskImages/`
 
 ### What goes in it
 
-- `.iso` files — booted directly via `sanboot`
+- `.iso` / `.img` files — booted directly via `sanboot`
 - `vmlinuz-*` + `initramfs-*.img` pairs — kernel + initrd direct boot
-- `undionly.kpxe` / `ipxe.efi` — PXE bootstrap loader (download from https://boot.ipxe.org)
+- Standalone `vmlinuz-*` kernels — booted directly without initrd
+- PXE bootstrap loaders (served via TFTP): `undionly.kpxe`, `ipxe.efi`, `snponly.efi`, `snp.efi`, `ipxe.efi.signed`, `bootx64.efi`, `grubx64.efi` (download from https://boot.ipxe.org)
 
 The server generates `boot.cfg` (an iPXE menu script) on every start. Delete it to force a fresh scan.
+
+---
+
+## Security
+
+- **HTTP path traversal prevention**: requests like `/../../../etc/passwd` are rejected with 403. Only files inside the boot directory (and configured `extra_paths`) are served.
+- **TFTP filename allowlist**: the TFTP server only serves files in its allowlist (`undionly.kpxe`, `ipxe.efi`, `snponly.efi`, `snp.efi`, `ipxe.efi.signed`, `bootx64.efi`, `grubx64.efi`). Requests for other files are rejected with "Access denied".
+- **TFTP non-ASCII rejection**: filenames containing non-ASCII characters are rejected to prevent encoding issues.
 
 ---
 
@@ -172,7 +182,7 @@ Non-root works on any device. Root mode requires a rooted device.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s test -v
+python3 -m pytest test/ -v
 ```
 
 ---
@@ -183,15 +193,19 @@ python3 -m unittest discover -s test -v
 servings-cli serve [OPTIONS]
 
 Options:
-  --port INTEGER       DHCP/ProxyDHCP UDP port (only used with --no-root)
-  --tftp-port INTEGER  TFTP UDP port (only used with --no-root)
-  --http-port INTEGER  HTTP TCP port for iPXE payloads
+  --port INTEGER       DHCP/ProxyDHCP UDP port (only used with --no-root) [default: 4011]
+  --tftp-port INTEGER  TFTP UDP port (only used with --no-root) [default: 6969]
+  --http-port INTEGER  HTTP TCP port for iPXE payloads [default: 8080]
   --boot-dir TEXT      Directory containing boot files (default: auto-detect)
   --no-root            Non-root mode: ProxyDHCP on 4011 + TFTP on 6969
-  --server-ip TEXT     Server IP on the client network
-  --boot-file TEXT     Boot file to serve
-  --android            Android/Termux mode
+  --server-ip TEXT     Server IP on the client network (default: 192.168.42.129)
+  --boot-file TEXT     Boot file to serve [default: undionly.kpxe]
+  --android            Android/Termux mode: scan shared storage, auto-detect USB IP
   --help               Show this message and exit
+
+servings-cli kill
+
+  Kill any running servings-cli server processes.
 ```
 
 ---
