@@ -37,7 +37,9 @@ def log(msg: str) -> None:
 def su(cmd: str) -> str:
     result = subprocess.run(
         ["su", "-c", cmd],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
     return result.stdout.strip()
 
@@ -95,7 +97,8 @@ def bring_up_rndis() -> str | None:
         try:
             out = subprocess.check_output(
                 ["ip", "-4", "-o", "addr", "show", "dev", iface],
-                stderr=subprocess.DEVNULL, timeout=3,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
             ).decode()
             for line in out.splitlines():
                 if "inet " in line:
@@ -115,8 +118,16 @@ def start_server(ip: str) -> None:
     log(f"Starting servings-cli on {ip}...")
     python = "/data/data/com.termux/files/usr/bin/python3"
     subprocess.Popen(
-        [python, "-m", "src.main", "serve", "--no-root", "--android",
-         "--server-ip", ip],
+        [
+            python,
+            "-m",
+            "src.main",
+            "serve",
+            "--no-root",
+            "--android",
+            "--server-ip",
+            ip,
+        ],
         stdout=open(LOG_FILE, "a"),
         stderr=subprocess.STDOUT,
     )

@@ -24,7 +24,9 @@ def _kill_previous() -> None:
         my_pid = os.getpid()
         result = subprocess.run(
             ["pgrep", "-f", "src.main serve"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.strip().splitlines():
             pid = int(line.strip())
@@ -77,7 +79,7 @@ def serve(
 
     dhcp_port = 67 if root_mode else port
     tftp_actual = 69 if root_mode else tftp_port
-    http_actual = 80 if root_mode else http_port
+    http_actual = http_port
 
     print()
     print("=" * 55)

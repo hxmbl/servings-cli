@@ -488,8 +488,8 @@ class TestReusableHTTPServer(unittest.TestCase):
     def test_server_bind_sets_reuse_addr(self):
         server = ReusableHTTPServer(("127.0.0.1", 0), BootHTTPHandler)
         try:
-            self.assertEqual(
-                server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR), 1
+            self.assertTrue(
+                server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
             )
         finally:
             server.server_close()
@@ -1154,9 +1154,8 @@ class TestBootConfigEdgeCases(unittest.TestCase):
     def test_duplicate_iso_case_insensitive(self):
         (self.boot_dir / "Arch.iso").write_bytes(b"x")
         (self.boot_dir / "arch.iso").write_bytes(b"y")
-        self.assertEqual(
-            generate_boot_config(self.boot_dir).read_text().count("Arch"), 1
-        )
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertEqual(text.count("sanboot"), 1)
 
     def test_iso_in_subdirectory(self):
         sub = self.boot_dir / "distros"

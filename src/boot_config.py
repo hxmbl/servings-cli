@@ -23,7 +23,6 @@ _IGNORED_DIRS = frozenset(
         ".vol",
         "System Volume Information",
         "$RECYCLE.BIN",
-        ".Spotlight-V100",
     }
 )
 

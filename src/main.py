@@ -102,8 +102,6 @@ def _detect_usb_ip() -> str | None:
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[1] == "part" and parts[2] != "":
-                # Check if the device path looks like a USB device
-                f"/dev/{parts[0]}"
                 try:
                     vendor = (
                         Path(f"/sys/block/{parts[0]}/device/vendor").read_text().strip()
