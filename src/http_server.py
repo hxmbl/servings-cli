@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+from src import client_journey as journey
+
 CHUNK_SIZE = 256 * 1024
 
 
@@ -128,6 +130,7 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
                 return
             ext = full_path.suffix.lower()
             content_type = MIME_TYPES.get(ext, "application/octet-stream")
+            journey.record(self.client_address[0], "HTTP", f"GET {path}")
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -144,7 +147,12 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
 
     def log_message(self, format: str, *args: object) -> None:
-        print(f"[+] HTTP {args[0]}")
+        # Successful GETs are shown by the client-journey chain; only
+        # surface errors here to keep the console one-line-per-event.
+        code = str(args[1]) if len(args) > 1 else ""
+        if code.startswith("2"):
+            return
+        print(f"[+] HTTP {args[0]} ({code})")
 
 
 def _http_server(

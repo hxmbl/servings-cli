@@ -16,6 +16,8 @@ import threading
 import time
 from pathlib import Path
 
+from src import client_journey as journey
+
 TFTP_RRQ = 1  # Read Request — client asks for a file
 TFTP_DATA = 3  # Data block — server sends a chunk
 TFTP_ACK = 4  # Acknowledgment — client confirms receipt
@@ -202,9 +204,6 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                         sock.sendto(error_pkt, addr)
                         continue
 
-                    print(
-                        f"[+] TFTP: serving {bare_name} to {addr} (requested: {filename})"
-                    )
                     try:
                         file_data = file_path.read_bytes()
                     except OSError as e:
@@ -214,6 +213,8 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                         )
                         sock.sendto(error_pkt, addr)
                         continue
+
+                    journey.record(addr[0], "TFTP", bare_name)
 
                     state = {
                         "file_data": file_data,

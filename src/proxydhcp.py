@@ -9,6 +9,8 @@ Root mode (port 67): replaces the existing DHCP server entirely (see dhcp_server
 import socket
 import threading
 
+from src import client_journey as journey
+
 
 def parse_packet(data: bytes, addr: tuple[str, int]) -> dict[str, object] | None:
     """Parse a DHCP/BOOTP packet and return PXE client info if valid.
@@ -63,10 +65,6 @@ def parse_packet(data: bytes, addr: tuple[str, int]) -> dict[str, object] | None
     # Detect BIOS vs EFI from vendor class string: "PXEClient:Arch:XXXX:..."
     # Arch 0 = BIOS, 6/7/8/9 = EFI variants
     boot_file = _detect_boot_file(vendor_class)
-
-    print(
-        f"[+] PXE request from {mac_readable} (TxID={transaction_id.hex()}) → {boot_file}"
-    )
     return {
         "client_address": addr,
         "transaction_id": transaction_id,
@@ -105,8 +103,6 @@ def send_proxy_reply(
     Only sends the PXE options (54, 60, 66, 67) — the IP was already assigned
     by Android's DHCP server. This is ProxyDHCP, not full DHCP.
     """
-    print(f"[*] Replying to {client_info['mac_readable']}...")
-
     packet = bytearray(240)
 
     # BOOTP header
@@ -137,7 +133,11 @@ def send_proxy_reply(
         client_info["client_address"][1],
     )
     sock.sendto(packet, target_address)
-    print(f"[+] Sent {len(packet)} bytes to {target_address}")
+    journey.record(
+        target_address[0],
+        "PXE",
+        f"{client_info['boot_file']} ({client_info['mac_readable']})",
+    )
 
 
 def _proxydhcp_listener(

@@ -91,6 +91,25 @@ cp archlinux-*.iso /sdcard/DiskImages/
 curl -o /sdcard/DiskImages/undionly.kpxe https://boot.ipxe.org/undionly.kpxe
 ```
 
+## Pre-flight checks & live boot chain
+
+On every start, servings-cli validates its own config instead of failing silently later:
+
+- `--server-ip` must be assigned to a local interface (clients fetch boot files from it directly)
+- `--boot-file` must exist in the boot dir **and** be in the TFTP allowlist — with the exact `curl` command to fetch it if missing
+- DHCP/TFTP/HTTP ports must be free
+- Root mode probes for an existing DHCP server and warns about the conflict
+
+Fatal problems stop startup with a clear fix message; `--force` overrides.
+
+While running, each client gets one correlated progress line across protocols:
+
+```
+[aa:bb:cc:dd:ee:ff] DHCP ACK 192.168.42.100 → TFTP undionly.kpxe → HTTP GET /boot.cfg
+```
+
+Where the chain stops tells you what's wrong: nothing after DHCP = network issue, nothing after TFTP = missing bootloader, nothing after HTTP = broken boot.cfg.
+
 ---
 
 ## Port reference
@@ -208,6 +227,7 @@ Options:
   --server-ip TEXT     Server IP on the client network (default: 192.168.42.129)
   --boot-file TEXT     Boot file to serve [default: undionly.kpxe]
   --android            Android/Termux mode: scan shared storage, auto-detect USB IP
+  --force              Start even if pre-flight checks fail
   --help               Show this message and exit
 
 servings-cli kill

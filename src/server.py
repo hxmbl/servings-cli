@@ -14,6 +14,7 @@ from pathlib import Path
 
 from src.boot_config import generate_boot_config
 from src.http_server import _http_server
+from src.preflight import run_preflight
 from src.proxydhcp import _proxydhcp_listener
 from src.tftp import _tftp_listener
 
@@ -130,6 +131,7 @@ def serve(
     server_ip: str = "192.168.42.129",
     boot_file: str = "undionly.kpxe",
     android: bool = False,
+    force: bool = False,
 ) -> None:
     _kill_previous()
     root = Path(boot_dir).resolve()
@@ -149,6 +151,29 @@ def serve(
     tftp_actual = 69 if root_mode else tftp_port
     http_actual = http_port
 
+    # Pre-flight — catch "looks started but can't possibly work" configs now
+    pf = run_preflight(
+        root_mode=root_mode,
+        server_ip=server_ip,
+        boot_file=boot_file,
+        boot_root=root,
+        dhcp_port=dhcp_port,
+        tftp_port=tftp_actual,
+        http_port=http_actual,
+    )
+    for warning in pf.warnings:
+        print(f"[!] {warning}")
+        print()
+    if pf.errors and not force:
+        for error in pf.errors:
+            print(f"[x] {error}")
+            print()
+        print("    Start anyway with --force")
+        raise SystemExit(1)
+    if pf.errors and force:
+        print("[!] --force: ignoring pre-flight errors above")
+        print()
+
     print()
     print("=" * 55)
     print("  servings-cli PXE Boot Server")
@@ -161,6 +186,7 @@ def serve(
     print(f"  Boot dir  : {root}")
     print(f"  Boot file : {boot_file}")
     print(f"  Server IP : {server_ip}")
+    print(f"  Client URL: http://{server_ip}:{http_actual}/boot.cfg")
     if android:
         print("  Platform  : Android/Termux")
     print("=" * 55)

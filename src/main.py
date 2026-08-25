@@ -188,6 +188,9 @@ def serve(
         "--android",
         help="Android/Termux mode: scan shared storage, auto-detect USB IP",
     ),
+    force: bool = typer.Option(
+        False, "--force", help="Start even if pre-flight checks fail"
+    ),
 ) -> None:
     """Start PXE boot servers.
 
@@ -234,6 +237,7 @@ def serve(
         server_ip=server_ip,
         boot_file=boot_file,
         android=android,
+        force=force,
     )
 
 

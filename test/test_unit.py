@@ -1617,9 +1617,7 @@ class TestIsServeCmdline(unittest.TestCase):
     def test_windows_python_exe(self):
         from src.server import _is_serve_cmdline
 
-        self.assertTrue(
-            _is_serve_cmdline(r"C:\Python312\python.exe -m src.main serve")
-        )
+        self.assertTrue(_is_serve_cmdline(r"C:\Python312\python.exe -m src.main serve"))
 
     def test_console_script_form(self):
         from src.server import _is_serve_cmdline
@@ -1785,6 +1783,173 @@ class TestUsbBootQuoting(unittest.TestCase):
         lun_cmd = next(c for c in cmds if c.startswith("printf"))
         # printf must treat it as data, not as a flag
         self.assertIn("-nevil.iso", lun_cmd)
+
+
+# --- Client Journey Tracker ---
+
+
+class TestClientJourney(unittest.TestCase):
+    def setUp(self):
+        from src import client_journey
+
+        client_journey.reset()
+
+    def _capture(self, fn, *args):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*args)
+        return buf.getvalue()
+
+    def test_chain_grows_across_stages(self):
+        from src import client_journey as journey
+
+        out = self._capture(journey.record, "192.0.2.10", "TFTP", "undionly.kpxe")
+        self.assertIn("TFTP undionly.kpxe", out)
+        out = self._capture(journey.record, "192.0.2.10", "HTTP", "GET /boot.cfg")
+        self.assertIn("TFTP undionly.kpxe → HTTP GET /boot.cfg", out)
+
+    def test_ip_and_mac_share_one_journey(self):
+        from src import client_journey as journey
+
+        journey.link_ip_to_mac("192.0.2.10", "aa:bb:cc:dd:ee:ff")
+        self._capture(journey.record, "aa:bb:cc:dd:ee:ff", "DHCP", "ACK 192.0.2.10")
+        out = self._capture(journey.record, "192.0.2.10", "HTTP", "GET /arch.iso")
+        # IP event is labeled with the MAC and shows the full chain
+        self.assertIn("[aa:bb:cc:dd:ee:ff]", out)
+        self.assertIn("DHCP ACK 192.0.2.10 → HTTP GET /arch.iso", out)
+
+    def test_repeated_stage_updates_in_place(self):
+        from src import client_journey as journey
+
+        self._capture(journey.record, "192.0.2.10", "HTTP", "GET /boot.cfg")
+        self._capture(journey.record, "192.0.2.10", "HTTP", "GET /vmlinuz")
+        chain = journey.chain_for("192.0.2.10")
+        self.assertIn("GET /vmlinuz", chain)
+        self.assertNotIn("GET /boot.cfg", chain)
+
+    def test_unseen_client_empty_chain(self):
+        from src import client_journey as journey
+
+        self.assertEqual(journey.chain_for("nobody"), "")
+
+    def test_capacity_eviction(self):
+        from src import client_journey as journey
+
+        for i in range(600):
+            journey.record(f"192.0.{i // 256}.{i % 256}", "DHCP", f"OFFER {i}")
+        self.assertLessEqual(len(journey._journeys), journey.MAX_JOURNEYS + 1)
+
+
+# --- Pre-flight Checks ---
+
+
+class TestPreflight(unittest.TestCase):
+    def test_loopback_is_local(self):
+        from src.preflight import ip_is_local
+
+        self.assertTrue(ip_is_local("127.0.0.1"))
+
+    def test_testnet_address_not_local(self):
+        from src.preflight import ip_is_local
+
+        self.assertFalse(ip_is_local("203.0.113.7"))
+
+    def test_missing_boot_file_is_fatal_with_hint(self):
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_preflight(
+                root_mode=False,
+                server_ip="127.0.0.1",
+                boot_file="undionly.kpxe",
+                boot_root=Path(tmp),
+                dhcp_port=44991,
+                tftp_port=44992,
+                http_port=44993,
+            )
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.errors)
+        self.assertIn("boot file missing", joined)
+        self.assertIn("curl -o", joined)
+        self.assertIn("https://boot.ipxe.org/undionly.kpxe", joined)
+
+    def test_non_allowlisted_boot_file_rejected(self):
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "my-custom-loader.efi").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=False,
+                server_ip="127.0.0.1",
+                boot_file="my-custom-loader.efi",
+                boot_root=Path(tmp),
+                dhcp_port=44994,
+                tftp_port=44995,
+                http_port=44996,
+            )
+        joined = "\n".join(result.errors)
+        self.assertIn("not in the TFTP allowlist", joined)
+        self.assertIn("undionly.kpxe", joined)
+
+    def test_valid_config_passes(self):
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=False,
+                server_ip="127.0.0.1",
+                boot_file="undionly.kpxe",
+                boot_root=Path(tmp),
+                dhcp_port=0,  # ephemeral = free
+                tftp_port=0,
+                http_port=0,
+            )
+        self.assertTrue(result.ok, msg=str(result.errors))
+
+    def test_remote_server_ip_flagged(self):
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=False,
+                server_ip="203.0.113.7",
+                boot_file="undionly.kpxe",
+                boot_root=Path(tmp),
+                dhcp_port=0,
+                tftp_port=0,
+                http_port=0,
+            )
+        joined = "\n".join(result.errors)
+        self.assertIn("NOT assigned to any local interface", joined)
+
+    def test_busy_tcp_port_detected(self):
+        from src.preflight import run_preflight
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("", 0))
+        blocker.listen(1)
+        busy_port = blocker.getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+                result = run_preflight(
+                    root_mode=False,
+                    server_ip="127.0.0.1",
+                    boot_file="undionly.kpxe",
+                    boot_root=Path(tmp),
+                    dhcp_port=0,
+                    tftp_port=0,
+                    http_port=busy_port,
+                )
+            joined = "\n".join(result.errors)
+            self.assertIn(f"HTTP port {busy_port} is already in use", joined)
+        finally:
+            blocker.close()
 
 
 if __name__ == "__main__":

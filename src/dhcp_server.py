@@ -11,6 +11,8 @@ import socket
 import threading
 from dataclasses import dataclass, field
 
+from src import client_journey as journey
+
 # DHCP message types
 DHCP_DISCOVER = 1
 DHCP_OFFER = 2
@@ -226,19 +228,19 @@ def dhcp_listener(
 
             ip = pool.allocate(mac_str)
             dest = (f"{subnet}.255", 68)
+            journey.link_ip_to_mac(ip, mac_str)
 
             tag = "PXE" if is_pxe else "DHCP"
 
             if request["msg_type"] == DHCP_DISCOVER:
-                print(f"[+] {tag}: DISCOVER from {mac_str} → offering {ip}")
+                print(f"[+] {tag}: DISCOVER from {mac_str}")
                 resp = _build_bootp_packet(
                     request, ip, server_ip, DHCP_OFFER, boot_file
                 )
                 s.sendto(resp, dest)
-                print(f"[+] {tag}: OFFER sent {ip} to {mac_str}")
+                journey.record(mac_str, "DHCP", f"OFFER {ip}")
 
             elif request["msg_type"] == DHCP_REQUEST:
-                print(f"[+] {tag}: REQUEST from {mac_str} → ACK {ip}")
                 resp = _build_bootp_packet(request, ip, server_ip, DHCP_ACK, boot_file)
                 s.sendto(resp, dest)
-                print(f"[+] {tag}: ACK {ip} to {mac_str}")
+                journey.record(mac_str, "DHCP", f"ACK {ip}")
