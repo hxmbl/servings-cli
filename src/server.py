@@ -5,6 +5,7 @@ Non-root mode: ProxyDHCP on 4011 + TFTP on 6969 (no privileges needed).
 """
 
 import os
+import re
 import subprocess
 import threading
 import traceback
@@ -17,27 +18,81 @@ from src.proxydhcp import _proxydhcp_listener
 from src.tftp import _tftp_listener
 
 
+def _is_serve_cmdline(cmdline: str) -> bool:
+    """True only for real servings-cli server invocations.
+
+    Requires a python/launcher first token AND `serve` as its own token right
+    after the module/script token. `pgrep -f` alone would also match unrelated
+    processes whose command line merely contains the string, e.g.
+    `vim src/main serve_notes.md` or `grep -r src.main serve docs`.
+    """
+    tokens = cmdline.split()
+    if len(tokens) < 2:
+        return False
+    # Case-insensitive + .exe-tolerant: macOS ps reports the resolved
+    # framework binary (".../MacOS/Python"), Windows uses "Python.exe".
+    first_base = re.sub(r".*[\\/]", "", tokens[0]).lower()
+    if first_base.endswith(".exe"):
+        first_base = first_base[: -len(".exe")]
+    looks_like_launcher = (
+        first_base.startswith(("python", "pypy")) or "servings-cli" in first_base
+    )
+    if not looks_like_launcher:
+        return False
+    for i in range(1, len(tokens) - 1):
+        prev_tok = tokens[i - 1]
+        tok_base = re.sub(r".*[\\/]", "", tokens[i]).lower()
+        module_form = prev_tok == "-m" and tok_base == "src.main"
+        script_form = tok_base == "main.py" or "servings-cli" in tok_base
+        if (module_form or script_form) and tokens[i + 1] == "serve":
+            return True
+    return False
+
+
 def _kill_previous() -> None:
-    """Kill any existing servings-cli server processes to free ports."""
+    """Kill any existing servings-cli server processes to free ports.
+
+    Candidates from pgrep are verified against their full command line before
+    being signalled — both to avoid killing unrelated processes and to guard
+    against killing a recycled PID.
+    """
     if os.name == "nt":
         return
     try:
         my_pid = os.getpid()
         result = subprocess.run(
-            ["pgrep", "-f", "src.main serve"],
+            ["pgrep", "-f", r"src\.main serve|servings-cli serve"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        for line in result.stdout.strip().splitlines():
-            pid = int(line.strip())
-            if pid != my_pid:
-                try:
-                    os.kill(pid, 9)
-                    print(f"[*] Killed old serve process (PID {pid})")
-                except (ProcessLookupError, PermissionError):
-                    pass
-    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not pids:
+            return
+        ps = subprocess.run(
+            ["ps", "-o", "pid=,command=", "-p", ",".join(pids)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in ps.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid == my_pid:
+                continue
+            if not _is_serve_cmdline(parts[1]):
+                continue
+            try:
+                os.kill(pid, 9)
+                print(f"[*] Killed old serve process (PID {pid})")
+            except (ProcessLookupError, PermissionError):
+                pass
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
 

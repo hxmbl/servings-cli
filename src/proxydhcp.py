@@ -40,9 +40,14 @@ def parse_packet(data: bytes, addr: tuple[str, int]) -> dict[str, object] | None
         tag = options_bytes[cursor]
         if tag == 255:  # end marker
             break
-        if cursor + 1 >= len(options_bytes):
+        if tag == 0:  # PAD — single byte, no length field (RFC 2132 §23.1)
+            cursor += 1
+            continue
+        if cursor + 2 > len(options_bytes):
             break
         length = options_bytes[cursor + 1]
+        if cursor + 2 + length > len(options_bytes):
+            break
         value = options_bytes[cursor + 2 : cursor + 2 + length]
 
         if tag == 60:

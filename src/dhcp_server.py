@@ -36,12 +36,17 @@ MAGIC_COOKIE = b"\x63\x82\x53\x63"
 
 @dataclass
 class IPPool:
-    """Simple IP pool — assigns addresses from a /24 subnet."""
+    """Simple IP pool — assigns addresses from a /24 subnet.
+
+    Wraps around when exhausted, evicting the oldest lease so two clients are
+    never handed the same address at the same time.
+    """
 
     subnet: str = "192.168.42"
     next_ip: int = 100
     max_ip: int = 200
     leases: dict[str, str] = field(default_factory=dict)
+    ip_owner: dict[str, str] = field(default_factory=dict)
 
     def allocate(self, mac: str) -> str:
         """Assign an IP to a MAC. Reuses existing lease if present."""
@@ -49,7 +54,13 @@ class IPPool:
             return self.leases[mac]
 
         ip = f"{self.subnet}.{self.next_ip}"
+        if ip in self.ip_owner:
+            # Pool wrapped around onto a live lease — evict its holder first
+            victim = self.ip_owner.pop(ip)
+            del self.leases[victim]
+
         self.leases[mac] = ip
+        self.ip_owner[ip] = mac
         self.next_ip += 1
 
         if self.next_ip > self.max_ip:
@@ -84,9 +95,14 @@ def _parse_dhcp_request(data: bytes) -> dict | None:
         tag = opts[cursor]
         if tag == OPT_END:
             break
-        if cursor + 1 >= len(opts):
+        if tag == 0:  # PAD — single byte, no length field (RFC 2132 §23.1)
+            cursor += 1
+            continue
+        if cursor + 2 > len(opts):
             break
         length = opts[cursor + 1]
+        if cursor + 2 + length > len(opts):
+            break
         value = opts[cursor + 2 : cursor + 2 + length]
 
         if tag == OPT_MESSAGE_TYPE and length == 1:
@@ -151,7 +167,13 @@ def _build_bootp_packet(
     # PXE-specific options — client uses these to find TFTP server + boot file
     opts += bytes([OPT_VENDOR_CLASS, 9]) + b"PXEClient"
     opts += bytes([OPT_TFTP_SERVER, 4]) + socket.inet_aton(server_ip)
-    opts += bytes([OPT_BOOT_FILE, len(boot_file) + 1]) + boot_file.encode() + b"\x00"
+    boot_file_bytes = boot_file.encode() + b"\x00"
+    if len(boot_file_bytes) > 255:
+        raise ValueError(
+            f"boot file name too long for DHCP option 67 "
+            f"({len(boot_file_bytes)} bytes, max 254)"
+        )
+    opts += bytes([OPT_BOOT_FILE, len(boot_file_bytes)]) + boot_file_bytes
 
     opts += bytes([OPT_END])
 

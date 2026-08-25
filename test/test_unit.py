@@ -553,11 +553,33 @@ class TestIpexScriptSyntax(unittest.TestCase):
         self.assertIn("My_OS_2_0_iso", text)
         self.assertIn("My OS 2.0.iso", text)
 
-    def test_dollar_sign_in_filename(self):
-        (self.boot_dir / "test$variable.iso").write_bytes(b"x")
-        self.assertIn(
-            "test$variable.iso", generate_boot_config(self.boot_dir).read_text()
-        )
+    def test_dollar_brace_injection_filename_skipped(self):
+        """${...} in a filename would be settings-expanded by iPXE — file must be skipped."""
+        (self.boot_dir / "evil${next-server}x.iso").write_bytes(b"x")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertNotIn("${next-server}", text)
+
+    def test_newline_command_injection_filename_skipped(self):
+        """A newline in a filename would inject a top-level iPXE command."""
+        name = "pwn\nsanboot iscsi:10.66.0.1::::iqn.evil#.iso"
+        (self.boot_dir / name).write_bytes(b"x")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertNotIn("sanboot iscsi", text)
+        self.assertNotIn("iqn.evil", text)
+        self.assertIn("No bootable images found", text)
+
+    def test_semicolon_injection_filename_skipped(self):
+        (self.boot_dir / "a;reboot#.iso").write_bytes(b"x")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertNotIn("a;reboot", text)
+
+    def test_duplicate_menu_keys_get_unique_labels(self):
+        """'my iso 1.0.iso' and 'my_iso_1_0.iso' previously collided into one goto label."""
+        (self.boot_dir / "my iso 1.0.iso").write_bytes(b"x")
+        (self.boot_dir / "my_iso_1_0.iso").write_bytes(b"y")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertIn(":my_iso_1_0_iso\n", text)
+        self.assertIn(":my_iso_1_0_iso_2\n", text)
 
     def test_multiple_iso_entries(self):
         for name in ("arch.iso", "fedora.iso", "ubuntu.iso"):
@@ -613,6 +635,24 @@ class TestDhcpMalformedOptions(unittest.TestCase):
             + bytes([255])
         )
         self.assertIsNotNone(_parse_dhcp_request(self._build(opts)))
+
+    def test_odd_pad_count_does_not_desync_parser(self):
+        """RFC 2132 PAD has no length byte — an odd pad count must still parse."""
+        opts = bytes([0]) + bytes([53, 1, DHCP_DISCOVER]) + bytes([255])
+        result = _parse_dhcp_request(self._build(opts))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["msg_type"], DHCP_DISCOVER)
+
+    def test_pad_between_options(self):
+        opts = (
+            bytes([53, 1, DHCP_DISCOVER, 0, 0, 0])
+            + bytes([60, 9])
+            + b"PXEClient"
+            + bytes([255])
+        )
+        result = _parse_dhcp_request(self._build(opts))
+        self.assertIsNotNone(result)
+        self.assertTrue(result["is_pxe"])
 
     def test_option_length_exceeding_remaining(self):
         opts = bytes([60, 250]) + b"PXE" + bytes([53, 1, DHCP_DISCOVER, 255])
@@ -785,6 +825,25 @@ class TestProxyDhcpPacketValidation(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["mac_readable"], "00:11:22:33:44:55")
 
+    def test_padded_pxe_discover_accepted(self):
+        """PAD bytes (no length field) before option 60 must not desync the walk."""
+        pkt = bytearray(240)
+        pkt[0] = 1
+        pkt[4:8] = b"\xde\xad\xbe\xef"
+        pkt[28:34] = b"\x00\x11\x22\x33\x44\x55"
+        pkt[236:240] = MAGIC_COOKIE
+        pkt += (
+            bytes([0])
+            + bytes([53, 1, 1])
+            + bytes([0])
+            + bytes([60, 9])
+            + b"PXEClient"
+            + bytes([255])
+        )
+        result = parse_packet(bytes(pkt), ("127.0.0.1", 68))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["boot_file"], "undionly.kpxe")
+
 
 # --- IP Pool ---
 
@@ -833,6 +892,27 @@ class TestIpPool(unittest.TestCase):
         ip1 = pool.allocate("aa:bb:cc:dd:ee:01")
         ip2 = pool.allocate("aa:bb:cc:dd:ee:02")
         self.assertEqual(ip1, ip2)
+
+    def test_wraparound_evicts_instead_of_duplicating(self):
+        """After wraparound onto a live lease the old holder is evicted — no
+        two active MACs ever share one address."""
+        pool = IPPool(subnet="10.0.0", next_ip=100, max_ip=101)
+        first_mac = "aa:bb:cc:dd:ee:01"
+        self.assertEqual(pool.allocate(first_mac), "10.0.0.100")
+        pool.allocate("aa:bb:cc:dd:ee:02")  # .101
+        # Pool exhausted — next allocation wraps onto .100
+        third = pool.allocate("aa:bb:cc:dd:ee:03")
+        self.assertEqual(third, "10.0.0.100")
+        # First MAC's lease was evicted, not duplicated
+        self.assertNotIn(first_mac, pool.leases)
+        self.assertEqual(len(set(pool.leases.values())), len(pool.leases))
+
+    def test_lease_table_bounded_by_pool_size(self):
+        """Spoofed random MACs cannot grow the table beyond the pool range."""
+        pool = IPPool(subnet="10.0.0", next_ip=100, max_ip=110)
+        for i in range(500):
+            pool.allocate(f"spoofed-mac-{i}")
+        self.assertLessEqual(len(pool.leases), 11)
 
     def test_custom_range(self):
         self.assertEqual(
@@ -1469,12 +1549,15 @@ class TestMainResolveBootDir(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     @patch("src.main._detect_usb_boot_dirs")
-    def test_fallback_to_dot(self, mock_usb):
+    def test_no_fallback_to_cwd(self, mock_usb):
+        """No boot dir must NOT silently fall back to '.' — that would serve
+        the current directory over HTTP to the whole LAN."""
         from src.main import _resolve_boot_dir
 
         mock_usb.return_value = []
-        result = _resolve_boot_dir(None)
-        self.assertEqual(result, ".")
+        with patch("builtins.print"):
+            result = _resolve_boot_dir(None)
+        self.assertIsNone(result)
 
     @patch("src.main._detect_usb_boot_dirs")
     def test_usb_detection(self, mock_usb):
@@ -1496,8 +1579,212 @@ class TestMainResolveBootDir(unittest.TestCase):
         from src.main import _resolve_boot_dir
 
         mock_usb.return_value = []
-        result = _resolve_boot_dir(None)
-        self.assertEqual(result, ".")
+        with patch("builtins.print"):
+            result = _resolve_boot_dir(None)
+        self.assertIsNone(result)
+
+
+# --- Kill Previous (collateral-kill guard) ---
+
+
+class TestIsServeCmdline(unittest.TestCase):
+    def test_module_form(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(_is_serve_cmdline("python -m src.main serve --no-root"))
+
+    def test_module_form_full_python_path(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(
+            _is_serve_cmdline(
+                "/data/data/com.termux/files/usr/bin/python3 -m src.main serve"
+            )
+        )
+
+    def test_macos_framework_python_binary(self):
+        """macOS ps shows the resolved framework binary 'MacOS/Python' (capital P)."""
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(
+            _is_serve_cmdline(
+                "/usr/local/Cellar/python@3.14/3.14.7/Frameworks/Python.framework"
+                "/Versions/3.14/Resources/Python.app/Contents/MacOS/Python "
+                "-m src.main serve --boot-dir /tmp/boot --no-root"
+            )
+        )
+
+    def test_windows_python_exe(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(
+            _is_serve_cmdline(r"C:\Python312\python.exe -m src.main serve")
+        )
+
+    def test_console_script_form(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(
+            _is_serve_cmdline("/usr/bin/python3 /usr/local/bin/servings-cli serve")
+        )
+
+    def test_direct_script_form(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertTrue(_is_serve_cmdline("python src/main.py serve"))
+
+    def test_editor_session_not_matched(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertFalse(_is_serve_cmdline("vim src/main serve_notes.md"))
+
+    def test_tail_of_log_not_matched(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertFalse(_is_serve_cmdline("tail -f logs/src.main serve.out"))
+
+    def test_grep_invocation_not_matched(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertFalse(_is_serve_cmdline("grep -r src.main serve ~/docs"))
+
+    def test_short_cmdline(self):
+        from src.server import _is_serve_cmdline
+
+        self.assertFalse(_is_serve_cmdline("serve"))
+        self.assertFalse(_is_serve_cmdline(""))
+
+
+# --- Boot File Option 67 Guard ---
+
+
+class TestBootFileGuard(unittest.TestCase):
+    def test_long_boot_file_raises_informative_error(self):
+        req = {
+            "xid": b"\x01\x02\x03\x04",
+            "mac": b"\xaa" * 6,
+            "mac_str": "aa:aa:aa:aa:aa:aa",
+            "msg_type": DHCP_DISCOVER,
+            "is_pxe": True,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            _build_bootp_packet(
+                req, "192.168.42.100", "192.168.42.129", DHCP_OFFER, "A" * 300
+            )
+        self.assertIn("option 67", str(ctx.exception))
+
+    def test_max_length_boot_file_accepted(self):
+        req = {
+            "xid": b"\x01\x02\x03\x04",
+            "mac": b"\xaa" * 6,
+            "mac_str": "aa:aa:aa:aa:aa:aa",
+            "msg_type": DHCP_DISCOVER,
+            "is_pxe": True,
+        }
+        pkt = _build_bootp_packet(
+            req, "192.168.42.100", "192.168.42.129", DHCP_OFFER, "B" * 254
+        )
+        self.assertEqual(pkt[0], 2)
+
+
+# --- CLI Input Validation ---
+
+
+class TestCliValidation(unittest.TestCase):
+    def test_valid_server_ip_normalized(self):
+        from src.main import _validate_server_ip
+
+        self.assertEqual(_validate_server_ip("192.168.1.5"), "192.168.1.5")
+
+    def test_shorthand_ip_rejected(self):
+        """inet_aton accepts '1' and '1.2.3' — we must not."""
+        import typer
+
+        from src.main import _validate_server_ip
+
+        for bad in ("1", "1.2.3", "localhost", "999.1.1.1", ""):
+            with self.assertRaises(typer.BadParameter):
+                _validate_server_ip(bad)
+
+    def test_boot_file_rejections(self):
+        import typer
+
+        from src.main import _validate_boot_file
+
+        for bad in ("", "a/b", "a\\b", "a\nb", "A" * 255):
+            with self.assertRaises(typer.BadParameter):
+                _validate_boot_file(bad)
+        self.assertEqual(_validate_boot_file("undionly.kpxe"), "undionly.kpxe")
+
+    def test_port_rejections(self):
+        import typer
+
+        from src.main import _validate_port
+
+        for bad in (0, -1, 65536, 100000):
+            with self.assertRaises(typer.BadParameter):
+                _validate_port(bad, "port")
+
+
+# --- USB Boot Script Command Injection Guard ---
+
+
+class TestUsbBootQuoting(unittest.TestCase):
+    """scripts/usb_boot.py interpolates attacker-controlled ISO paths (shared
+    storage) into `su -c` shell strings — they must be safely quoted."""
+
+    @staticmethod
+    def _load_module():
+        import importlib.util
+
+        script = Path(__file__).resolve().parent.parent / "scripts" / "usb_boot.py"
+        spec = importlib.util.spec_from_file_location("usb_boot", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _run_present_iso(path_str: str) -> list[str]:
+        """Run present_iso with subprocess captured; return all su command strings."""
+        from unittest.mock import MagicMock
+
+        mod = TestUsbBootQuoting._load_module()
+        cmds: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            if len(cmd) > 2:
+                cmds.append(cmd[2])
+            return MagicMock(stdout="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.LOG_FILE = Path(tmp) / "test.log"
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                with patch.object(mod.time, "sleep"):
+                    mod.present_iso(Path(path_str))
+        return cmds
+
+    def test_present_iso_quotes_malicious_filename(self):
+        cmds = self._run_present_iso("/sdcard/DiskImages/pwn$(id > /data/owned).iso")
+        lun_cmd = next(c for c in cmds if c.startswith("printf"))
+        # $(...) must appear only inside a single-quoted token
+        self.assertIn("'/sdcard/DiskImages/pwn$(id > /data/owned).iso'", lun_cmd)
+        self.assertNotIn(
+            "$(", lun_cmd.replace("'/sdcard/DiskImages/pwn$(id > /data/owned).iso'", "")
+        )
+        # printf format-first form — immune to leading-dash filenames
+        self.assertTrue(lun_cmd.startswith("printf"))
+
+    def test_present_iso_plain_path_still_written(self):
+        cmds = self._run_present_iso("/sdcard/DiskImages/arch.iso")
+        lun_cmd = next(c for c in cmds if c.startswith("printf"))
+        self.assertIn("printf '%s\\n' /sdcard/DiskImages/arch.iso", lun_cmd)
+        self.assertIn("/lun.0/file", lun_cmd)
+
+    def test_present_iso_leading_dash_filename(self):
+        cmds = self._run_present_iso("/sdcard/DiskImages/-nevil.iso")
+        lun_cmd = next(c for c in cmds if c.startswith("printf"))
+        # printf must treat it as data, not as a flag
+        self.assertIn("-nevil.iso", lun_cmd)
 
 
 if __name__ == "__main__":

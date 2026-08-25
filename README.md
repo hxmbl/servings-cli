@@ -128,9 +128,16 @@ The server generates `boot.cfg` (an iPXE menu script) on every start. Delete it 
 
 ## Security
 
-- **HTTP path traversal prevention**: requests like `/../../../etc/passwd` are rejected with 403. Only files inside the boot directory (and configured `extra_paths`) are served.
+- **HTTP path traversal prevention**: requests like `/../../../etc/passwd` are rejected with 403. Only files inside the boot directory (and configured `extra_paths`) are served. Files are opened once and verified by inode before streaming, closing symlink-swap races.
+- **iPXE script injection prevention**: filenames are embedded into `boot.cfg`, so files whose names contain script-dangerous characters (`$`, newlines, `;`, backticks, quotes, etc.) are skipped with a warning — a malicious filename can no longer inject iPXE commands that execute on booting clients.
 - **TFTP filename allowlist**: the TFTP server only serves files in its allowlist (`undionly.kpxe`, `ipxe.efi`, `snponly.efi`, `snp.efi`, `ipxe.efi.signed`, `bootx64.efi`, `grubx64.efi`). Requests for other files are rejected with "Access denied".
 - **TFTP non-ASCII rejection**: filenames containing non-ASCII characters are rejected to prevent encoding issues.
+- **TFTP flood tolerance**: RRQs are rate-limited per source, and stale/forged ACKs no longer tear down in-flight transfers.
+- **No silent CWD fallback**: if no boot directory is found, the server refuses to start instead of serving your current directory over HTTP.
+- **Careful process cleanup**: startup only kills processes that are verifiably servings-cli servers (python/servings-cli launcher + `serve` subcommand), never unrelated processes whose command line merely contains matching text.
+- **CLI validation**: `--server-ip` must be a real IPv4 address and `--boot-file` must fit DHCP option 67; invalid values are rejected at startup instead of crashing the DHCP thread mid-request.
+
+Note: like every PXE server, the UDP listeners bind wildcard addresses — PXE clients may broadcast or arrive on any interface, so these services are LAN-facing by design. Don't expose them to untrusted networks.
 
 ---
 

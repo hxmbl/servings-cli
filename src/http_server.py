@@ -1,23 +1,28 @@
 """HTTP server — streams boot payloads (kernel, initrd, ISOs) to iPXE clients."""
 
+import os
 import socket
 import threading
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
 CHUNK_SIZE = 256 * 1024
 
 
-class ReusableHTTPServer(HTTPServer):
-    """HTTPServer with SO_REUSEADDR set before bind.
+class ReusableHTTPServer(ThreadingHTTPServer):
+    """Threading HTTPServer with SO_REUSEADDR set before bind.
 
+    Threading so one slow client (huge ISO over a slow link, or a dead socket)
+    cannot block every other boot request. daemon_threads keeps shutdown
+    instant even with stuck connections.
     Prevents 'Address already in use' errors after crashes.
     Skips HTTPServer.server_bind()'s socket.getfqdn() call which
     does a reverse DNS lookup that can hang for seconds on 0.0.0.0.
     """
 
+    daemon_threads = True
     allow_reuse_address = True
     allow_reuse_port = False
 
@@ -56,6 +61,22 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
 
     boot_root: Path = Path(".")
     extra_paths: list[Path] = []
+    # Drop connections that send nothing / stall — without this a dead client
+    # pins its worker thread forever.
+    timeout = 60
+
+    def _path_allowed(self, full_path: Path) -> bool:
+        boot_root_str = str(self.boot_root.resolve())
+        full_path_str = str(full_path)
+        if full_path_str == boot_root_str or full_path_str.startswith(
+            boot_root_str + "/"
+        ):
+            return True
+        for extra in self.extra_paths:
+            extra_str = str(extra.resolve())
+            if full_path_str == extra_str or full_path_str.startswith(extra_str + "/"):
+                return True
+        return False
 
     def do_GET(self) -> None:
         path = unquote(self.path.lstrip("/"))
@@ -68,22 +89,8 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             self.send_error(404)
             return
-        boot_root_resolved = self.boot_root.resolve()
-        boot_root_str = str(boot_root_resolved)
-        full_path_str = str(full_path)
-        allowed = full_path_str == boot_root_str or full_path_str.startswith(
-            boot_root_str + "/"
-        )
-        if not allowed:
-            for extra in self.extra_paths:
-                extra_resolved = extra.resolve()
-                extra_str = str(extra_resolved)
-                if full_path_str == extra_str or full_path_str.startswith(
-                    extra_str + "/"
-                ):
-                    allowed = True
-                    break
-        if not allowed:
+
+        if not self._path_allowed(full_path):
             self.send_error(403)
             return
 
@@ -98,38 +105,64 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            file_size = full_path.stat().st_size
+            # Capture the identity now and verify it against the opened file
+            # below, so a symlink swapped between check and stream cannot
+            # escape the jail mid-response.
+            expected = full_path.stat()
+        except OSError:
+            self.send_error(404)
+            return
+
+        try:
+            f = open(full_path, "rb")
+        except OSError as e:
+            print(f"[!] HTTP: cannot open {path}: {e}")
+            self.send_error(404)
+            return
+
+        with f:
+            st = os.fstat(f.fileno())
+            if (st.st_ino, st.st_dev) != (expected.st_ino, expected.st_dev):
+                print(f"[!] HTTP: {path} changed while opening — refusing")
+                self.send_error(404)
+                return
             ext = full_path.suffix.lower()
             content_type = MIME_TYPES.get(ext, "application/octet-stream")
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(file_size))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            with open(full_path, "rb") as f:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(st.st_size))
+                self.send_header("Connection", "close")
+                self.end_headers()
                 while True:
                     chunk = f.read(CHUNK_SIZE)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
-        except Exception as e:
-            print(f"[!] HTTP: error serving {path}: {e}")
-            traceback.print_exc()
+            except Exception as e:
+                print(f"[!] HTTP: error serving {path}: {e}")
+                traceback.print_exc()
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[+] HTTP {args[0]}")
 
 
-def _http_server(port: int, boot_root: Path, shutdown: threading.Event) -> None:
+def _http_server(
+    port: int, boot_root: Path, shutdown: threading.Event, bind_addr: str = "0.0.0.0"
+) -> None:
     """Start the HTTP file server."""
     server = None
     try:
         BootHTTPHandler.boot_root = boot_root
-        server = ReusableHTTPServer(("0.0.0.0", port), BootHTTPHandler)
+        server = ReusableHTTPServer((bind_addr, port), BootHTTPHandler)
         print(f"[*] HTTP listening on TCP {port} (root: {boot_root})")
-        server.timeout = 1.0
-        while not shutdown.is_set():
-            server.handle_request()
+
+        def _watch_shutdown() -> None:
+            shutdown.wait()
+            server.shutdown()
+
+        threading.Thread(target=_watch_shutdown, daemon=True).start()
+        server.serve_forever(poll_interval=0.5)
     except Exception:
         traceback.print_exc()
     finally:

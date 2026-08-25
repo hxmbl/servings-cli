@@ -308,8 +308,8 @@ class TestTFTPIntegration(unittest.TestCase):
             t.join(timeout=2)
             os.chmod(allowed, 0o644)
 
-    def test_tftp_ack_mismatch_drops_transfer(self):
-        """Wrong ACK block number causes transfer to be dropped."""
+    def test_bad_ack_does_not_kill_transfer(self):
+        """A stale/forged ACK is ignored — the transfer survives and advances on a valid ACK."""
         port, shutdown, t = start_tftp(self.boot_dir)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -317,19 +317,42 @@ class TestTFTPIntegration(unittest.TestCase):
             sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
             data, _ = sock.recvfrom(2048)
             self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_DATA)
-            # Send wrong ACK (block 99 instead of 1)
+            # Forged/stale ACK (block 99) must NOT tear down the transfer
             sock.sendto(struct.pack("!HH", TFTP_ACK, 99), ("127.0.0.1", port))
             try:
+                sock.settimeout(0.5)
                 sock.recvfrom(2048)
+                self.fail("Bad ACK should not trigger any response")
             except TimeoutError:
                 pass
-            # Transfer state was dropped; try re-requesting
+            sock.settimeout(3.0)
+            # Valid ACK still works — transfer state survived
+            sock.sendto(struct.pack("!HH", TFTP_ACK, 1), ("127.0.0.1", port))
+            data2, _ = sock.recvfrom(2048)
+            opcode, block = struct.unpack("!HH", data2[:4])
+            self.assertEqual(opcode, TFTP_DATA)
+            self.assertEqual(block, 2)
+            sock.close()
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+
+    def test_duplicate_ack_resends_last_block(self):
+        """Duplicate ACK of the last block means our DATA was lost — server resends it."""
+        port, shutdown, t = start_tftp(self.boot_dir)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
             sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
-            try:
-                data2, _ = sock.recvfrom(2048)
-                self.assertEqual(struct.unpack("!H", data2[:2])[0], TFTP_DATA)
-            except TimeoutError:
-                pass
+            d1, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!HH", d1[:4]), (TFTP_DATA, 1))
+            sock.sendto(struct.pack("!HH", TFTP_ACK, 1), ("127.0.0.1", port))
+            d2, _ = sock.recvfrom(2048)
+            self.assertEqual(struct.unpack("!HH", d2[:4]), (TFTP_DATA, 2))
+            # Duplicate ACK for block 1 — resend block 2 verbatim
+            sock.sendto(struct.pack("!HH", TFTP_ACK, 1), ("127.0.0.1", port))
+            d2_again, _ = sock.recvfrom(2048)
+            self.assertEqual(d2_again, d2)
             sock.close()
         finally:
             shutdown.set()

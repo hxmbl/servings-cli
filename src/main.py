@@ -5,14 +5,15 @@ Use --no-root for ProxyDHCP on port 4011 (works alongside your existing DHCP).
 Use --android for Termux/Android-specific paths and IP auto-detection.
 """
 
+import ipaddress
 import sys
 from pathlib import Path
+
+import typer
 
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
-
-import typer  # noqa: E402
 
 from src.server import _kill_previous  # noqa: E402
 from src.server import serve as _serve  # noqa: E402
@@ -74,51 +75,41 @@ def _detect_usb_boot_dirs() -> list[Path]:
     return candidates
 
 
-def _detect_usb_ip() -> str | None:
-    """Detect IP address on a USB tethering interface."""
-    import subprocess
+def _validate_server_ip(value: str) -> str:
+    """Reject anything that isn't a plain dotted-quad IPv4 address.
 
-    for iface in ("usb0", "rndis0", "enx*"):
-        try:
-            out = subprocess.check_output(
-                ["ip", "-4", "-o", "addr", "show", "dev", iface],
-                stderr=subprocess.DEVNULL,
-                timeout=3,
-            ).decode()
-            for line in out.splitlines():
-                line = line.strip()
-                if "inet " in line:
-                    return line.split()[1].split("/")[0]
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            continue
-
-    # Fallback: check lsblk for USB devices
+    socket.inet_aton would happily accept shorthand like '1' or '1.2.3',
+    which then produces nonsense subnet/broadcast derivations.
+    """
     try:
-        out = subprocess.check_output(
-            ["lsblk", "-rno", "NAME,TYPE,MOUNTPOINT"],
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        ).decode()
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[1] == "part" and parts[2] != "":
-                try:
-                    vendor = (
-                        Path(f"/sys/block/{parts[0]}/device/vendor").read_text().strip()
-                    )
-                    if "USB" in vendor.upper():
-                        mount = Path(parts[2])
-                        if mount.exists():
-                            return str(mount)
-                except (FileNotFoundError, PermissionError):
-                    pass
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    return None
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        raise typer.BadParameter(
+            f"--server-ip must be a dotted-quad IPv4 address, got {value!r}"
+        )
 
 
-def _resolve_boot_dir(explicit: str | None, android: bool = False) -> str:
+def _validate_boot_file(value: str) -> str:
+    """Boot file goes into DHCP option 67 — keep it embeddable in one byte length."""
+    if not value:
+        raise typer.BadParameter("--boot-file must not be empty")
+    if "/" in value or "\\" in value or any(ord(c) < 0x20 for c in value):
+        raise typer.BadParameter(
+            "--boot-file must be a bare filename without path separators "
+            "or control characters"
+        )
+    if len(value.encode()) + 1 > 255:
+        raise typer.BadParameter("--boot-file is too long (max 254 bytes)")
+    return value
+
+
+def _validate_port(value: int, name: str) -> int:
+    if not (1 <= value <= 65535):
+        raise typer.BadParameter(f"--{name} must be between 1 and 65535")
+    return value
+
+
+def _resolve_boot_dir(explicit: str | None, android: bool = False) -> str | None:
     if explicit:
         return explicit
     candidates = list(_BOOT_DIR_CANDIDATES)
@@ -141,7 +132,11 @@ def _resolve_boot_dir(explicit: str | None, android: bool = False) -> str:
         )
         print(f"[*] Auto-detected USB drive: {best}")
         return str(best)
-    return "."
+    # No silent CWD fallback — serving the current directory over HTTP would
+    # expose whatever the user happens to be standing in to the whole LAN.
+    print("[!] No boot directory found.")
+    print("    Create ~/servings-boot/ or pass --boot-dir /path/to/boot/files")
+    return None
 
 
 def _detect_android_ip() -> str | None:
@@ -221,7 +216,15 @@ def serve(
         else:
             server_ip = "192.168.42.129"
 
+    _validate_port(port, "port")
+    _validate_port(tftp_port, "tftp-port")
+    _validate_port(http_port, "http-port")
+    server_ip = _validate_server_ip(server_ip or "")
+    boot_file = _validate_boot_file(boot_file)
+
     resolved = _resolve_boot_dir(boot_dir, android=android)
+    if resolved is None:
+        raise typer.Exit(1)
     _serve(
         port=port,
         tftp_port=tftp_port,

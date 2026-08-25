@@ -9,6 +9,7 @@ Usage:
     python3 usb_boot.py /path/to/iso.iso # Direct: use specific ISO
 """
 
+import shlex
 import subprocess
 import sys
 import time
@@ -54,7 +55,11 @@ def find_isos() -> list[Path]:
 
 def present_iso(iso_path: Path) -> None:
     log(f"Presenting {iso_path.name} as USB mass storage...")
-    su(f"echo {iso_path} > {MASS_STORAGE}/lun.0/file")
+    # shlex.quote: iso_path comes from shared storage where any app can plant
+    # files — an unquoted path would let a filename like `pwn$(reboot).iso`
+    # execute arbitrary commands as root inside the su shell.
+    q = shlex.quote(str(iso_path))
+    su(f"printf '%s\\n' {q} > {MASS_STORAGE}/lun.0/file")
     su(f"echo 1 > {MASS_STORAGE}/lun.0/removable")
     su(f"echo 1 > {MASS_STORAGE}/lun.0/ro")
     su(f"echo mass_storage,adb > {GADGET_BASE}/os_desc/use")
@@ -64,21 +69,25 @@ def present_iso(iso_path: Path) -> None:
 
 
 def wait_for_read(timeout: int = 30) -> bool:
+    """Poll UDC state until the gadget reports 'configured' (PC is reading).
+
+    Returns False if the timeout elapses without confirmation.
+    """
     log(f"Waiting up to {timeout}s for PC to read ISO...")
-    stats_path = Path("/sys/class/udc/7000000.dwc3")
     start = time.time()
     while time.time() - start < timeout:
         try:
-            if (stats_path / "inep_0").exists():
-                log("UDC stats available — PC is reading")
-        except Exception:
+            states = list(Path("/sys/class/udc").glob("*/state"))
+            if any(s.read_text().strip() == "configured" for s in states):
+                log("UDC configured — PC is reading")
+                return True
+        except OSError:
             pass
         time.sleep(2)
-        # Simple timeout approach
         elapsed = int(time.time() - start)
         if elapsed % 10 == 0 and elapsed > 0:
             log(f"  ...{elapsed}s elapsed")
-    return True
+    return False
 
 
 def switch_to_rndis() -> None:
@@ -117,20 +126,21 @@ def bring_up_rndis() -> str | None:
 def start_server(ip: str) -> None:
     log(f"Starting servings-cli on {ip}...")
     python = "/data/data/com.termux/files/usr/bin/python3"
-    subprocess.Popen(
-        [
-            python,
-            "-m",
-            "src.main",
-            "serve",
-            "--no-root",
-            "--android",
-            "--server-ip",
-            ip,
-        ],
-        stdout=open(LOG_FILE, "a"),
-        stderr=subprocess.STDOUT,
-    )
+    with open(LOG_FILE, "a") as logf:
+        subprocess.Popen(
+            [
+                python,
+                "-m",
+                "src.main",
+                "serve",
+                "--no-root",
+                "--android",
+                "--server-ip",
+                ip,
+            ],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+        )
     log("servings-cli started")
 
 
@@ -143,6 +153,8 @@ def pick_iso(isos: list[Path]) -> Path | None:
         print(f"  [{i + 1}] {iso.name}")
     try:
         choice = int(input("Pick: ")) - 1
+        if not 0 <= choice < len(isos):
+            return None
         return isos[choice]
     except (ValueError, IndexError):
         return None
@@ -168,7 +180,8 @@ def main() -> None:
     log(f"Starting USB boot workflow with {iso.name}")
 
     present_iso(iso)
-    wait_for_read()
+    if not wait_for_read():
+        log("WARNING: no confirmation the PC read the ISO — continuing anyway")
     switch_to_rndis()
     ip = bring_up_rndis()
     if ip:
