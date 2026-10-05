@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # One run per ref; a new push supersedes an in-flight run for the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install --upgrade pip "ruff==0.16.4"
+
+      - name: ruff check
+        run: ruff check src/ scripts/ test/
+
+      # `ruff format` is not enforced yet — the codebase predates it and
+      # reformatting everything is its own reviewable change. `ruff.toml`
+      # already carries the [format] config for when that happens.
+
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor from pyproject's requires-python; 3.14 is current.
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      # test_wire.py dissects real loopback traffic with tshark. Without it
+      # those tests still pass, so a missing tshark would leave a green build
+      # in which nothing protocol-level actually ran. DEBIAN_FRONTEND stops
+      # tshark's dumpcap privilege prompt from hanging the install.
+      - name: Install tshark
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tshark
+          tshark --version | head -1
+      # The symlink containment tests self-skip when symlink_to is refused,
+      # and a skipped test is indistinguishable from a passing one. On Linux
+      # it always works, so fail here rather than shipping a security test
+      # that silently never ran.
+      - name: Verify symlinks are usable
+        run: |
+          python - <<'PY'
+          import tempfile, pathlib
+          with tempfile.TemporaryDirectory() as d:
+              p = pathlib.Path(d) / "target"
+              p.write_text("x")
+              try:
+                  (pathlib.Path(d) / "link").symlink_to(p)
+              except OSError as e:
+                  raise SystemExit(f"symlinks unusable on this runner: {e}")
+              print("symlinks OK")
+          PY
+
+      - name: pytest
+        # -rA shows every outcome so a skip is visible rather than buried in
+        # a summary line. Output is kept in /tmp/pytest.log for the next step.
+        run: |
+          set -o pipefail
+          pytest test/ -v -rA --tb=short | tee /tmp/pytest.log
+
+      - name: Assert nothing was skipped
+        # pytest exits 0 when tests are skipped, and a skipped security test is
+        # indistinguishable from a passing one. The symlink check above proves
+        # the capability exists, so any skip here is worth failing on.
+        run: |
+          if grep -qE '^SKIPPED ' /tmp/pytest.log; then
+            echo "::error::tests were skipped:"
+            grep -E '^SKIPPED ' /tmp/pytest.log
+            exit 1
+          fi
+          echo "no skips"
+
+      - name: Smoke-test the CLI
+        # Entry points only: actually serving binds privileged ports (67/69),
+        # which this runner can't do. This catches a broken typer app or a bad
+        # import path, which the unit tests import directly and would miss.
+        run: |
+          servings-cli --help > /dev/null
+          servings-cli serve --help > /dev/null
+          servings-cli kill --help > /dev/null
+          echo "CLI entry points OK"

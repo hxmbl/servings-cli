@@ -1409,16 +1409,25 @@ class TestBootConfigEdgeCases(unittest.TestCase):
         )
 
     def test_symlink_not_followed_into_jail(self):
+        """A symlink escaping the boot dir must not become a menu entry.
+
+        It would 403 over HTTP, so listing it produces a permanently broken
+        boot option.
+        """
         outside = Path(tempfile.mkdtemp()) / "secret.txt"
         outside.write_bytes(b"secret")
-        link = self.boot_dir / "sneaky"
+        link = self.boot_dir / "sneaky.iso"
         try:
             link.symlink_to(outside)
-        except OSError:
-            self.skipTest("Cannot create symlinks")
+        except OSError as e:
+            self.skipTest(f"Cannot create symlinks: {e}")
+        self.assertTrue(link.is_symlink(), "symlink was not created")
         (self.boot_dir / "test.iso").write_bytes(b"x")
         text = generate_boot_config(self.boot_dir).read_text()
+        self.assertNotIn("sneaky.iso", text)
         self.assertNotIn("secret", text)
+        # The legitimate file must still be listed.
+        self.assertIn("test.iso", text)
         outside.unlink()
         link.unlink()
 
@@ -2403,8 +2412,9 @@ class TestPathGuard(unittest.TestCase):
         link = self.root / "link.txt"
         try:
             link.symlink_to(self.outside)
-        except OSError:
-            self.skipTest("Cannot create symlinks")
+        except OSError as e:
+            self.skipTest(f"Cannot create symlinks: {e}")
+        self.assertTrue(link.is_symlink(), "symlink was not created")
         self.assertIsNone(resolve_within(self.root, link))
 
     def test_parent_traversal_rejected(self):

@@ -253,15 +253,24 @@ class TestTFTPIntegration(unittest.TestCase):
         Regression: the listener used to read through the symlink with no
         containment check at all, so the target's bytes were streamed to any
         client on the LAN. read_bytes() happily follows symlinks.
+
+        setUp already created undionly.kpxe as a real file, so it must be
+        removed before symlinking — otherwise symlink_to raises FileExistsError,
+        which is an OSError, and the test skips itself instead of testing
+        anything. That is exactly how it managed to skip silently for so long.
         """
         outside = Path(tempfile.mkdtemp()) / "secret.txt"
         outside.write_bytes(b"SECRET")
         link = self.boot_dir / "undionly.kpxe"
+        link.unlink(missing_ok=True)
         try:
             link.symlink_to(outside)
-        except OSError:
-            self.skipTest("Cannot create symlinks")
+        except OSError as e:
+            self.skipTest(f"Cannot create symlinks: {e}")
             return
+        # Prove the symlink is really in place — a silent skip must not be
+        # mistaken for a passing containment check.
+        self.assertTrue(link.is_symlink(), "symlink was not created")
         port, shutdown, t = start_tftp(self.boot_dir)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -283,7 +292,12 @@ class TestTFTPIntegration(unittest.TestCase):
         subdir.mkdir()
         link = self.boot_dir / "undionly.kpxe"
         link.unlink(missing_ok=True)
-        link.symlink_to(subdir)
+        try:
+            link.symlink_to(subdir)
+        except OSError as e:
+            self.skipTest(f"Cannot create symlinks: {e}")
+            return
+        self.assertTrue(link.is_symlink(), "symlink was not created")
         port, shutdown, t = start_tftp(self.boot_dir)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -470,8 +484,9 @@ class TestHTTPIntegration(unittest.TestCase):
         link = self.boot_dir / "leak.iso"
         try:
             link.symlink_to(outside)
-        except OSError:
-            self.skipTest("Cannot create symlinks")
+        except OSError as e:
+            self.skipTest(f"Cannot create symlinks: {e}")
+        self.assertTrue(link.is_symlink(), "symlink was not created")
         self.port, shutdown, t = start_http(self.boot_dir)
         try:
             import urllib.error

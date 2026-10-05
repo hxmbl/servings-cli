@@ -264,6 +264,11 @@ python3 -m pytest test/ -v
 `test_wire.py` additionally needs `tshark` on `PATH`; it dissects real traffic
 on loopback to check the packets are spec-compliant.
 
+CI (`.github/workflows/ci.yml`) runs `ruff check` plus the suite on Python 3.12
+and 3.14, with `tshark` installed so the wire tests really run. It also fails
+the build if any test is *skipped* — several security tests self-skip when
+symlinks are unavailable, and a skip is otherwise indistinguishable from a pass.
+
 ---
 
 ## CLI reference
