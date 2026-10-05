@@ -58,7 +58,7 @@ The phone's Qualcomm USB controller (`7000000.dwc3`) supports ConfigFS gadget
 configuration. Available functions:
 
 - `mass_storage.0` — USB mass storage (DriveDroid mode)
-- `rndis.rndis` / `rndis_bam.rndis` — USB Ethernet (tethering mode)
+- `rndis.rndis` — USB Ethernet (tethering mode)
 - `ffs.adb` — ADB (FunctionFS)
 
 Mode switching via Android property system:
@@ -151,18 +151,25 @@ must be self-contained — it can't call home, can't get help, can't be
 debugged remotely. The script must handle all failures gracefully and
 report status via Termux output (user is watching the terminal).
 
+This is why gadget writes are checked rather than best-effort: with no way to
+call for help, a silent failure here looks exactly like a broken cable.
+
 ## What's Needed to Finish
 
 ### Phase 1: `scripts/usb_boot.py` (~80 lines Python)
-- [ ] Detect ISOs on `/storage/emulated/0/Disk Images/`
-- [ ] Present chosen ISO via `setprop sys.usb.config mass_storage,adb`
-- [ ] Set LUN backing file, `removable=1`, `ro=1`
-- [ ] Wait for PC to read (timeout / notification / I/O stats)
-- [ ] Switch to rndis: `setprop sys.usb.config rndis,adb`
-- [ ] Bring up rndis0: `ip link set rndis0 up`
-- [ ] Detect phone IP from rndis0
-- [ ] Start servings-cli: `python3 -m src.main serve --no-root --android`
-- [ ] Log progress to `usb-switch.log`
+- [x] Detect ISOs on `/sdcard/DiskImages` and `/storage/emulated/0/DiskImages`
+- [x] Set LUN backing file, `removable=1`, `ro=1`
+- [x] Wait for PC to read (UDC state poll — heuristic, see Phase 3)
+- [x] Switch to rndis
+- [x] Bring up rndis0: `ip link set rndis0 up`
+- [x] Detect phone IP from rndis0, falling back to a static address
+- [x] Start servings-cli: `python -m src.main serve --no-root --android`
+- [x] Log progress to `usb-switch.log`
+
+The script writes ConfigFS directly and checks each write's exit status, rather
+than going through `setprop sys.usb.config ...`. Both work; ConfigFS is what
+lets it verify the write actually landed (SELinux denials and an unrooted
+device now abort with the reason logged).
 
 ### Phase 2: Reliable USB switching
 - [ ] Fix rndis0 auto-init after mode switch
@@ -235,11 +242,14 @@ report status via Termux output (user is watching the terminal).
 
 ## Files
 
-- `scripts/usb_boot.py` — Python script for USB boot workflow (~80 lines)
-- `usb-switch.sh` — Shell version for manual testing (on phone)
+- `scripts/usb_boot.py` — Python script for USB boot workflow
 - `src/main.py:_detect_android_ip()` — Auto-detects USB tethering IP
 - `src/server.py` — Starts ProxyDHCP + TFTP + HTTP
+- `src/preflight.py` — Startup validation (reports its findings into the log)
 - `DRIVEDROID-CONCEPT.md` — This file
+
+(`usb-switch.sh` is referenced in the "What We Know Works" section as a manual
+shell variant; it is not in this repository.)
 
 ## References
 

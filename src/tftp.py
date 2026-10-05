@@ -1,12 +1,17 @@
 """TFTP server — serves the bootstrap loader (undionly.kpxe / ipxe.efi) to PXE clients.
 
 This is the second stage of PXE boot:
-1. PC gets IP via DHCP (port 67/4011)
-2. DHCP tells PC to load "undionly.kpxe" via TFTP from our server
+1. PC gets IP via DHCP (port 67) or the router's DHCP + ProxyDHCP (port 4011)
+2. DHCP tells PC to load a loader via TFTP from our server
 3. PC sends TFTP RRQ → we stream the file back
 4. iPXE takes over and loads the real OS via HTTP (port 8080)
 
 TFTP is simple: client sends RRQ, we send DATA blocks, client ACKs each one.
+
+Only the seven names in ALLOWED_BOOT_FILES are served — kernels and images go
+over HTTP, which is far faster and can range-request. Apple PXE clients prefix
+the request with /01-XX-XX-XX-XX-XX-XX/, which is stripped to a basename
+before the allowlist check.
 """
 
 import selectors
@@ -17,6 +22,7 @@ import time
 from pathlib import Path
 
 from src import client_journey as journey
+from src import pathguard
 
 TFTP_RRQ = 1  # Read Request — client asks for a file
 TFTP_DATA = 3  # Data block — server sends a chunk
@@ -146,12 +152,29 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                             ack_block = struct.unpack("!H", data[2:4])[0]
                             cur = state["block_num"]
                             if ack_block == cur:
-                                done = _tftp_send_next_block(sock, addr, state)
+                                try:
+                                    done = _tftp_send_next_block(sock, addr, state)
+                                except OSError as e:
+                                    # Keep the transfer state: a transient send
+                                    # failure (peer vanished) should not
+                                    # discard it — the client can re-ACK and we
+                                    # resume from where we were.
+                                    print(
+                                        f"[!] TFTP: failed to send block "
+                                        f"{cur} to {addr}: {e}"
+                                    )
+                                    continue
                                 if done:
                                     del transfers[addr]
                             elif ack_block == (cur - 1) & 0xFFFF and cur > 1:
                                 # Duplicate ACK — our last DATA was lost; resend it.
-                                _tftp_resend_last_block(sock, addr, state)
+                                try:
+                                    _tftp_resend_last_block(sock, addr, state)
+                                except OSError as e:
+                                    print(
+                                        f"[!] TFTP: failed to resend block "
+                                        f"to {addr}: {e}"
+                                    )
                             # Anything else (stale/forged ACK): ignore without
                             # tearing down the transfer — timeout cleans up.
                             continue
@@ -196,8 +219,26 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                         continue
 
                     file_path = boot_dir / bare_name
-                    if not file_path.exists():
-                        print(f"[!] TFTP: {bare_name} not found at {file_path}")
+
+                    # Containment check. The allowlist already forces a bare
+                    # filename, so this only has to catch symlinks (and any
+                    # future caller that loosens the allowlist): bare_name can
+                    # be a symlink pointing anywhere on the filesystem, and
+                    # read_bytes() would happily stream the target.
+                    resolved = pathguard.resolve_within(boot_dir, file_path)
+                    if resolved is None:
+                        print(
+                            f"[!] TFTP: refusing {bare_name} from {addr} — "
+                            "resolves outside the boot directory"
+                        )
+                        error_pkt = (
+                            struct.pack("!HH", TFTP_ERROR, 2) + b"Access denied\x00"
+                        )
+                        sock.sendto(error_pkt, addr)
+                        continue
+
+                    if not resolved.exists():
+                        print(f"[!] TFTP: {bare_name} not found at {resolved}")
                         error_pkt = (
                             struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
                         )
@@ -205,9 +246,9 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                         continue
 
                     try:
-                        file_data = file_path.read_bytes()
+                        file_data = resolved.read_bytes()
                     except OSError as e:
-                        print(f"[!] TFTP: failed to read {file_path.name}: {e}")
+                        print(f"[!] TFTP: failed to read {resolved.name}: {e}")
                         error_pkt = (
                             struct.pack("!HH", TFTP_ERROR, 1) + b"File not found\x00"
                         )
@@ -222,7 +263,15 @@ def _tftp_listener(port: int, boot_dir: Path, shutdown: threading.Event) -> None
                         "offset": 0,
                         "last_active": time.time(),
                     }
-                    done = _tftp_send_next_block(sock, addr, state)
+                    # Send failures must not escape the loop either. The
+                    # journey line is recorded above, so if the DATA never
+                    # went out the operator sees the TFTP stage with no HTTP
+                    # stage after it and knows to look here.
+                    try:
+                        done = _tftp_send_next_block(sock, addr, state)
+                    except OSError as e:
+                        print(f"[!] TFTP: failed to send {bare_name} to {addr}: {e}")
+                        continue
                     if not done:
                         transfers[addr] = state
     finally:

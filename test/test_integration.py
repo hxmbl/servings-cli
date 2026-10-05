@@ -248,7 +248,12 @@ class TestTFTPIntegration(unittest.TestCase):
             t.join(timeout=2)
 
     def test_symlink_to_outside_returns_error(self):
-        """Symlink pointing outside boot_dir — TFTP returns ERROR."""
+        """Symlink pointing outside boot_dir — TFTP returns ERROR.
+
+        Regression: the listener used to read through the symlink with no
+        containment check at all, so the target's bytes were streamed to any
+        client on the LAN. read_bytes() happily follows symlinks.
+        """
         outside = Path(tempfile.mkdtemp()) / "secret.txt"
         outside.write_bytes(b"SECRET")
         link = self.boot_dir / "undionly.kpxe"
@@ -264,6 +269,7 @@ class TestTFTPIntegration(unittest.TestCase):
             sock.sendto(make_rrq("undionly.kpxe"), ("127.0.0.1", port))
             data, _ = sock.recvfrom(2048)
             self.assertEqual(struct.unpack("!H", data[:2])[0], TFTP_ERROR)
+            self.assertNotIn(b"SECRET", data)
             sock.close()
         finally:
             shutdown.set()
@@ -438,6 +444,46 @@ class TestHTTPIntegration(unittest.TestCase):
         finally:
             shutdown.set()
             t.join(timeout=2)
+
+    def test_subdirectory_file_is_served(self):
+        """Regression: files below the boot root must be reachable.
+
+        The jail used to compare resolved strings against a hard-coded '/'
+        separator, so on Windows it refused every file in the tree. This
+        pins the behaviour the generated boot.cfg depends on.
+        """
+        sub = self.boot_dir / "distros" / "arch"
+        sub.mkdir(parents=True)
+        (sub / "arch.iso").write_bytes(b"NESTED_ISO")
+        self.port, shutdown, t = start_http(self.boot_dir)
+        try:
+            status, _, body = self._get("/distros/arch/arch.iso")
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"NESTED_ISO")
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+
+    def test_symlinked_file_outside_boot_dir_refused(self):
+        outside = Path(tempfile.mkdtemp()) / "secret.txt"
+        outside.write_bytes(b"SECRET")
+        link = self.boot_dir / "leak.iso"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("Cannot create symlinks")
+        self.port, shutdown, t = start_http(self.boot_dir)
+        try:
+            import urllib.error
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/leak.iso")
+            self.assertEqual(ctx.exception.code, 403)
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+            outside.unlink(missing_ok=True)
+            link.unlink(missing_ok=True)
 
     def test_404_for_root_path(self):
         self.port, shutdown, t = start_http(self.boot_dir)

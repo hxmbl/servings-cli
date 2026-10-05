@@ -4,11 +4,16 @@
 Presents an ISO as USB mass storage, waits for the PC to read it,
 then switches to RNDIS tethering and starts servings-cli.
 
+Requires root (su). Every gadget write is checked, so an unrooted device or a
+SELinux denial aborts with the reason logged rather than continuing to a later
+step that cannot work. Progress goes to stdout and usb-switch.log.
+
 Usage:
-    python3 usb_boot.py                  # Interactive: pick ISO
-    python3 usb_boot.py /path/to/iso.iso # Direct: use specific ISO
+    python3 scripts/usb_boot.py                  # Interactive: pick ISO
+    python3 scripts/usb_boot.py /path/to/iso.iso # Direct: use specific ISO
 """
 
+import os
 import shlex
 import subprocess
 import sys
@@ -35,13 +40,40 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
-def su(cmd: str) -> str:
-    result = subprocess.run(
-        ["su", "-c", cmd],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+def su(cmd: str, *, check: bool = False) -> str:
+    """Run a command under su.
+
+    Every failure mode here is silent by default: `su` missing (not rooted),
+    denied, or SELinux refusing the write all produce a non-zero exit and some
+    stderr. The old version discarded the return code entirely, so present_iso
+    went on to log "ISO presented — PC should see USB CD-ROM now" after the
+    write had in fact been refused. stderr is surfaced on failure so the log
+    says why.
+    """
+    try:
+        result = subprocess.run(
+            ["su", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        log(f"[!] su not found — is this device rooted? (cmd: {cmd})")
+        if check:
+            raise
+        return ""
+    except subprocess.TimeoutExpired:
+        log(f"[!] su timed out after 10s: {cmd}")
+        if check:
+            raise
+        return ""
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        log(f"[!] su command failed (rc={result.returncode}): {cmd}")
+        if detail:
+            log(f"    {detail}")
+        if check:
+            raise RuntimeError(f"su failed: {cmd}: {detail}")
     return result.stdout.strip()
 
 
@@ -54,16 +86,23 @@ def find_isos() -> list[Path]:
 
 
 def present_iso(iso_path: Path) -> None:
+    """Point the USB mass-storage LUN at an ISO. Raises if a write is refused.
+
+    Without the LUN backing file the PC sees an empty drive and every later step
+    is meaningless, so these are all checked — the old version ignored su's exit
+    status and logged success regardless.
+
+    The path is shlex-quoted because it comes from shared storage, where any app
+    can plant files: unquoted, a name like `pwn$(reboot).iso` would run as root
+    inside the su shell.
+    """
     log(f"Presenting {iso_path.name} as USB mass storage...")
-    # shlex.quote: iso_path comes from shared storage where any app can plant
-    # files — an unquoted path would let a filename like `pwn$(reboot).iso`
-    # execute arbitrary commands as root inside the su shell.
     q = shlex.quote(str(iso_path))
-    su(f"printf '%s\\n' {q} > {MASS_STORAGE}/lun.0/file")
-    su(f"echo 1 > {MASS_STORAGE}/lun.0/removable")
-    su(f"echo 1 > {MASS_STORAGE}/lun.0/ro")
-    su(f"echo mass_storage,adb > {GADGET_BASE}/os_desc/use")
-    su(f"echo '' > {CONFIGS}/strings/0x409/configuration/UDC")
+    su(f"printf '%s\\n' {q} > {MASS_STORAGE}/lun.0/file", check=True)
+    su(f"echo 1 > {MASS_STORAGE}/lun.0/removable", check=True)
+    su(f"echo 1 > {MASS_STORAGE}/lun.0/ro", check=True)
+    su(f"echo mass_storage,adb > {GADGET_BASE}/os_desc/use", check=True)
+    su(f"echo '' > {CONFIGS}/strings/0x409/configuration/UDC", check=True)
     time.sleep(1)
     log("ISO presented — PC should see USB CD-ROM now")
 
@@ -71,7 +110,9 @@ def present_iso(iso_path: Path) -> None:
 def wait_for_read(timeout: int = 30) -> bool:
     """Poll UDC state until the gadget reports 'configured' (PC is reading).
 
-    Returns False if the timeout elapses without confirmation.
+    A heuristic, not proof: 'configured' means the host enumerated the device,
+    not that it read the whole ISO. Returns False on timeout; the caller warns
+    and continues, since a slow host is not a failure.
     """
     log(f"Waiting up to {timeout}s for PC to read ISO...")
     start = time.time()
@@ -92,14 +133,22 @@ def wait_for_read(timeout: int = 30) -> bool:
 
 def switch_to_rndis() -> None:
     log("Switching USB gadget to RNDIS tethering...")
-    su(f"echo rndis,adb > {GADGET_BASE}/os_desc/use")
+    su(f"echo rndis,adb > {GADGET_BASE}/os_desc/use", check=True)
     time.sleep(3)
     log("RNDIS mode activated — PC should detect USB Ethernet")
 
 
 def bring_up_rndis() -> str | None:
+    """Return the phone's USB-tethering IPv4 address, or None if there isn't one.
+
+    rndis0 does not always come up by itself after the mode switch (see
+    DRIVEDROID-CONCEPT.md, Known Issues), so this brings it up and falls back to
+    adding a static address. Returns None rather than a guessed address when
+    both attempts fail: handing the server an IP it does not hold produces a
+    misleading pre-flight error instead of an honest failure here.
+    """
     log("Bringing up rndis0 interface...")
-    su("ip link set rndis0 up")
+    su("ip link set rndis0 up", check=True)
     time.sleep(1)
 
     for iface in ("rndis0", "usb0"):
@@ -117,15 +166,32 @@ def bring_up_rndis() -> str | None:
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             continue
 
-    # Try adding a static IP if none assigned
-    su("ip addr add 192.168.42.129/24 dev rndis0")
-    log("Added static IP 192.168.42.129 on rndis0")
-    return "192.168.42.129"
+    static = "192.168.42.129"
+    if su(f"ip addr add {static}/24 dev rndis0", check=True):
+        log(f"Added static IP {static} on rndis0")
+        return static
+    log(f"[!] Could not add {static}/24 to rndis0 — check USB gadget setup")
+    return None
+
+
+# Repository root, so the child process can import src.main regardless of
+# the directory this script was launched from. `-m` resolves the module
+# against the *child's* cwd, so without this the server silently failed to
+# start whenever usb_boot.py was run from anywhere but the repo root.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def start_server(ip: str) -> None:
+    """Launch servings-cli detached, in non-root mode, and return immediately.
+
+    The child's own output goes to usb-switch.log, so if pre-flight rejects the
+    configuration it is recorded there rather than lost — the script itself
+    exits as soon as the process is spawned and cannot report that failure.
+    """
     log(f"Starting servings-cli on {ip}...")
     python = "/data/data/com.termux/files/usr/bin/python3"
+    if not os.path.exists(python):
+        python = sys.executable
     with open(LOG_FILE, "a") as logf:
         subprocess.Popen(
             [
@@ -138,10 +204,11 @@ def start_server(ip: str) -> None:
                 "--server-ip",
                 ip,
             ],
+            cwd=str(PROJECT_ROOT),
             stdout=logf,
             stderr=subprocess.STDOUT,
         )
-    log("servings-cli started")
+    log("servings-cli started (output continues in this log)")
 
 
 def pick_iso(isos: list[Path]) -> Path | None:
@@ -153,11 +220,15 @@ def pick_iso(isos: list[Path]) -> Path | None:
         print(f"  [{i + 1}] {iso.name}")
     try:
         choice = int(input("Pick: ")) - 1
-        if not 0 <= choice < len(isos):
-            return None
-        return isos[choice]
-    except (ValueError, IndexError):
+    except (ValueError, EOFError):
+        print("Not a number — aborting.")
         return None
+    # Both bad-input paths explain themselves; previously they exited(1) with
+    # nothing printed, leaving the user to guess why nothing happened.
+    if not 0 <= choice < len(isos):
+        print(f"No such option (enter 1-{len(isos)}) — aborting.")
+        return None
+    return isos[choice]
 
 
 def main() -> None:
@@ -179,6 +250,7 @@ def main() -> None:
     print(f"\n=== USB Boot: {iso.name} ===\n")
     log(f"Starting USB boot workflow with {iso.name}")
 
+    # Raises with the reason logged if any gadget write is refused.
     present_iso(iso)
     if not wait_for_read():
         log("WARNING: no confirmation the PC read the ISO — continuing anyway")

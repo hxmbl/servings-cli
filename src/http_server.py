@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from src import client_journey as journey
+from src import pathguard
 
 CHUNK_SIZE = 256 * 1024
 
@@ -25,11 +26,18 @@ class ReusableHTTPServer(ThreadingHTTPServer):
     """
 
     daemon_threads = True
-    allow_reuse_address = True
+    # SO_REUSEADDR means two different things depending on the platform:
+    # on POSIX it says "ignore sockets left in TIME_WAIT by the previous
+    # process" (exactly what a crash-and-restart needs), but on Windows it
+    # means "other processes may bind this port too" — enabling it there
+    # turns a restart into a silent port hijack. Only set it where it means
+    # what we want.
+    allow_reuse_address = os.name != "nt"
     allow_reuse_port = False
 
     def server_bind(self) -> None:
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.allow_reuse_address:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if self.allow_reuse_port and hasattr(socket, "SO_REUSEPORT"):
             if self.address_family in (socket.AF_INET, socket.AF_INET6):
                 try:
@@ -62,23 +70,24 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
     """Serves boot assets from the configured boot directory."""
 
     boot_root: Path = Path(".")
+    # Additional directories to serve from, if a caller wants any. Nothing
+    # sets this in production; it exists for embedders and tests.
     extra_paths: list[Path] = []
-    # Drop connections that send nothing / stall — without this a dead client
-    # pins its worker thread forever.
+    # Socket timeout, applied to the whole connection. Bounds how long a dead
+    # or silent client can pin a worker thread.
     timeout = 60
 
     def _path_allowed(self, full_path: Path) -> bool:
-        boot_root_str = str(self.boot_root.resolve())
-        full_path_str = str(full_path)
-        if full_path_str == boot_root_str or full_path_str.startswith(
-            boot_root_str + "/"
-        ):
-            return True
-        for extra in self.extra_paths:
-            extra_str = str(extra.resolve())
-            if full_path_str == extra_str or full_path_str.startswith(extra_str + "/"):
-                return True
-        return False
+        """True if full_path is inside the boot root or a configured extra path.
+
+        Compares resolved Paths, not strings: string prefix matching with a
+        hard-coded "/" separator silently refused every file on Windows,
+        where resolved paths use "\".
+        """
+        return any(
+            pathguard.is_within(root, full_path)
+            for root in (self.boot_root, *self.extra_paths)
+        )
 
     def do_GET(self) -> None:
         path = unquote(self.path.lstrip("/"))
@@ -87,8 +96,15 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            full_path = (self.boot_root / path).resolve()
+            full_path = pathguard.native_join(self.boot_root, path)
         except (ValueError, OSError):
+            self.send_error(404)
+            return
+
+        try:
+            full_path = full_path.resolve()
+        except (ValueError, OSError, RuntimeError):
+            # Embedded NUL, symlink loop, unreadable parent: unusable path.
             self.send_error(404)
             return
 
@@ -130,6 +146,10 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
                 return
             ext = full_path.suffix.lower()
             content_type = MIME_TYPES.get(ext, "application/octet-stream")
+            # Recorded before the first byte goes out. Unlike DHCP and TFTP
+            # there is no sendto() that can fail here — once the headers are
+            # written the response is committed, and a mid-stream disconnect
+            # is a client-side problem we cannot report as a failure anyway.
             journey.record(self.client_address[0], "HTTP", f"GET {path}")
             try:
                 self.send_response(200)
@@ -158,7 +178,14 @@ class BootHTTPHandler(BaseHTTPRequestHandler):
 def _http_server(
     port: int, boot_root: Path, shutdown: threading.Event, bind_addr: str = "0.0.0.0"
 ) -> None:
-    """Start the HTTP file server."""
+    """Start the HTTP file server.
+
+    Startup failures (e.g. the port is already taken) propagate to the
+    caller's future on purpose. Swallowing them here made a dead HTTP server
+    indistinguishable from a healthy one to the orchestrator: the thread
+    returned, the future completed with no exception, and the crash monitor
+    had nothing to report. See server._monitor_futures.
+    """
     server = None
     try:
         BootHTTPHandler.boot_root = boot_root
@@ -171,8 +198,6 @@ def _http_server(
 
         threading.Thread(target=_watch_shutdown, daemon=True).start()
         server.serve_forever(poll_interval=0.5)
-    except Exception:
-        traceback.print_exc()
     finally:
         if server:
             server.server_close()

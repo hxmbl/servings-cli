@@ -403,9 +403,67 @@ class TestHttpEdgeCases(unittest.TestCase):
         self.assertIn(b"403", handler.wfile.getvalue())
 
     def test_traversal_with_backslash(self):
+        """Backslash traversal must not escape the jail.
+
+        POSIX treats '\\' as an ordinary filename character, so the request
+        resolves to a (nonexistent) file inside the boot dir -> 404. Windows
+        treats it as a separator, so it is a real traversal attempt -> 403.
+        Either way it must not be served.
+        """
         handler = make_handler("GET", "/..\\..\\etc\\passwd")
         handler.do_GET()
-        self.assertIn(b"404", handler.wfile.getvalue())
+        output = handler.wfile.getvalue()
+        self.assertNotIn(b"200 OK", output)
+        if os.name == "nt":
+            self.assertIn(b"403", output)
+        else:
+            self.assertIn(b"404", output)
+
+    def test_backslash_named_file_served(self):
+        """Regression: the jail compared str(Path) against a hard-coded '/'
+        separator, so on Windows every single request was refused.
+
+        On POSIX the backslash is an ordinary filename character, so this is
+        simply a request for a file called 'sub\\served.txt'. Either way the
+        point is that a real file inside the boot dir is reachable.
+        """
+        if os.name == "nt":
+            self.skipTest("POSIX filename semantics")
+        (self.boot_dir / "sub\\served.txt").write_bytes(b"INSIDE")
+        handler = make_handler("GET", "/sub\\served.txt")
+        handler.do_GET()
+        self.assertIn(b"200", handler.wfile.getvalue())
+        self.assertIn(b"INSIDE", handler.wfile.getvalue())
+
+    def test_backslash_separator_served(self):
+        """Same path spelled with a separator: on Windows this is
+        boot_dir/served.txt and must be served. On POSIX it is a different
+        (missing) filename -> 404."""
+        (self.boot_dir / "served.txt").write_bytes(b"INSIDE")
+        handler = make_handler("GET", "/sub\\served.txt")
+        handler.do_GET()
+        output = handler.wfile.getvalue()
+        if os.name == "nt":
+            self.assertIn(b"200", output)
+            self.assertIn(b"INSIDE", output)
+        else:
+            self.assertIn(b"404", output)
+
+    def test_subdirectory_served(self):
+        """Files below the boot root are reachable — boot.cfg points iPXE at
+        nested paths, so this has to work."""
+        sub = self.boot_dir / "distros" / "arch"
+        sub.mkdir(parents=True)
+        (sub / "arch.iso").write_bytes(b"NESTED")
+        handler = make_handler("GET", "/distros/arch/arch.iso")
+        handler.do_GET()
+        self.assertIn(b"200", handler.wfile.getvalue())
+        self.assertIn(b"NESTED", handler.wfile.getvalue())
+
+    def test_windows_style_absolute_drive_rejected(self):
+        handler = make_handler("GET", "/C:/Windows/win.ini")
+        handler.do_GET()
+        self.assertNotIn(b"200 OK", handler.wfile.getvalue())
 
     def test_null_byte_in_path(self):
         handler = make_handler("GET", "/test.txt%00.html")
@@ -486,11 +544,20 @@ class TestHttpChunkedTransfer(unittest.TestCase):
 
 class TestReusableHTTPServer(unittest.TestCase):
     def test_server_bind_sets_reuse_addr(self):
+        """SO_REUSEADDR is set on POSIX only.
+
+        On Windows the same option means "other processes may bind this port
+        too", which turns a restart into a silent port hijack.
+        """
         server = ReusableHTTPServer(("127.0.0.1", 0), BootHTTPHandler)
         try:
-            self.assertTrue(
+            is_set = bool(
                 server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
             )
+            if os.name == "nt":
+                self.assertFalse(is_set)
+            else:
+                self.assertTrue(is_set)
         finally:
             server.server_close()
 
@@ -914,6 +981,102 @@ class TestIpPool(unittest.TestCase):
             pool.allocate(f"spoofed-mac-{i}")
         self.assertLessEqual(len(pool.leases), 11)
 
+    def test_eviction_is_reported(self):
+        """Recycling an address a live client still holds is announced.
+
+        Eviction does not prevent an address conflict, it *creates* one — the
+        evicted client keeps its lease and is never told. Staying silent about
+        it left two machines believing they owned the same address with no
+        hint in the console.
+        """
+        events = []
+        pool = IPPool(subnet="10.0.0", next_ip=100, max_ip=101)
+        pool.on_evict = lambda ip, victim, new: events.append((ip, victim, new))
+        pool.allocate("mac-a")
+        pool.allocate("mac-b")
+        self.assertEqual(events, [])
+        pool.allocate("mac-c")
+        self.assertEqual(events, [("10.0.0.100", "mac-a", "mac-c")])
+
+    def test_no_eviction_callback_is_safe(self):
+        pool = IPPool(subnet="10.0.0", next_ip=100, max_ip=101)
+        pool.allocate("mac-a")
+        pool.allocate("mac-b")
+        self.assertEqual(pool.allocate("mac-c"), "10.0.0.100")
+
+
+class TestDhcpReplyFailure(unittest.TestCase):
+    """A reply that cannot be sent must not kill the listener.
+
+    The sendto() exception used to escape dhcp_listener and terminate the
+    thread, so a single unreachable client stopped DHCP for everyone.
+    """
+
+    def test_listener_survives_failed_sendto(self):
+        import socket as _socket
+        import threading
+        import time
+        import types
+
+        from src import client_journey as cj
+        from src import dhcp_server as ds
+
+        cj.reset()
+        port = 45311
+        shutdown = threading.Event()
+        mac = b"\xaa\xbb\xcc\xdd\xee\x01"
+        mac_str = "aa:bb:cc:dd:ee:01"
+
+        real_socket = _socket.socket
+
+        class FlakySocket(real_socket):
+            def sendto(self, *a, **k):
+                raise OSError(101, "Network is unreachable")
+
+        fake = types.SimpleNamespace(
+            AF_INET=_socket.AF_INET,
+            SOCK_DGRAM=_socket.SOCK_DGRAM,
+            SOL_SOCKET=_socket.SOL_SOCKET,
+            SO_REUSEADDR=_socket.SO_REUSEADDR,
+            SO_REUSEPORT=getattr(_socket, "SO_REUSEPORT", 0),
+            SO_BROADCAST=_socket.SO_BROADCAST,
+            socket=FlakySocket,
+            inet_aton=_socket.inet_aton,
+        )
+        original = ds.socket
+        ds.socket = fake
+        t = threading.Thread(
+            target=ds.dhcp_listener,
+            args=(port, "undionly.kpxe", shutdown, "127.0.0.1"),
+            daemon=True,
+        )
+        try:
+            t.start()
+            time.sleep(0.3)
+
+            pkt = bytearray(240)
+            pkt[0] = 1
+            pkt[1] = 1
+            pkt[2] = 6
+            pkt[4:8] = b"\x01\x00\x00\x01"
+            pkt[28:34] = mac
+            pkt[236:240] = ds.MAGIC_COOKIE
+            pkt += bytes([53, 1, 1]) + bytes([60, 9]) + b"PXEClient" + bytes([255])
+
+            s = real_socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.sendto(bytes(pkt), ("127.0.0.1", port))
+            time.sleep(0.6)
+
+            self.assertTrue(t.is_alive(), "DHCP listener died on a failed send")
+            # The failure must be visible, not silently swallowed.
+            self.assertEqual(cj.chain_for(mac_str), "")
+        finally:
+            shutdown.set()
+            t.join(timeout=2)
+            ds.socket = original
+            s.close()
+
     def test_custom_range(self):
         self.assertEqual(
             IPPool(subnet="172.16.0", next_ip=10, max_ip=15).allocate(
@@ -1314,9 +1477,61 @@ class TestBootConfigEdgeCases(unittest.TestCase):
             self.assertIn(name, _IGNORED_NAMES)
 
     def test_initrd_img_extension(self):
-        """The .img extension is recognized for initrds."""
+        """`.img` alone is NOT enough to call something an initrd.
+
+        It is also the disk-image extension, and treating every `.img` as an
+        initrd meant unpaired disk images were dropped from the menu with no
+        warning. Initrd detection is by name; a raw `.img` becomes a sanboot
+        entry instead.
+        """
         self.assertTrue(_is_initrd(Path("initrd.img")))
-        self.assertTrue(_is_initrd(Path("test.img")))
+        self.assertTrue(_is_initrd(Path("initramfs-foo.img")))
+        self.assertFalse(_is_initrd(Path("test.img")))
+        self.assertFalse(_is_initrd(Path("arch-linux.img")))
+
+    def test_img_alone_becomes_sanboot_entry(self):
+        """A boot dir of only .img files must produce a real menu.
+
+        Previously every .img was claimed as an initrd, matched no kernel,
+        and vanished — the menu ended up with zero items.
+        """
+        (self.boot_dir / "arch-linux.img").write_bytes(b"i")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertIn("sanboot ${boot-path}", text)
+        self.assertIn("item arch-linux_img", text)
+        # The empty-menu placeholder is the `item --gap` line, not the
+        # `:boot_none` label that always exists as a fallback target.
+        self.assertNotIn("item --gap -- No bootable images found", text)
+
+    def test_single_lone_initrd_is_paired_by_position_with_warning(self):
+        """One kernel + one leftover initrd is unambiguous, so pair it — but
+        say so, since the pairing is a guess rather than a name match."""
+        (self.boot_dir / "vmlinuz-core").write_bytes(b"k")
+        (self.boot_dir / "initramfs-other.img").write_bytes(b"r")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertIn("initrd /initramfs-other.img", text)
+
+    def test_ambiguous_leftovers_are_not_paired(self):
+        """Two kernels + two unmatched initrds must NOT be paired up by
+        position: the old code produced arbitrary pairings and silently
+        dropped the rest, which panics at boot."""
+        (self.boot_dir / "vmlinuz-a").write_bytes(b"k")
+        (self.boot_dir / "vmlinuz-b").write_bytes(b"k")
+        (self.boot_dir / "initramfs-x.img").write_bytes(b"r")
+        (self.boot_dir / "initramfs-y.img").write_bytes(b"r")
+        text = generate_boot_config(self.boot_dir).read_text()
+        self.assertNotIn("initrd /", text)
+        self.assertIn("vmlinuz-a", text)
+        self.assertIn("vmlinuz-b", text)
+
+    def test_classify_priority(self):
+        from src.boot_config import classify
+
+        self.assertEqual(classify(Path("initramfs-linux.img")), "initrd")
+        self.assertEqual(classify(Path("vmlinuz-linux")), "kernel")
+        self.assertEqual(classify(Path("arch.iso")), "disk_image")
+        self.assertEqual(classify(Path("arch.img")), "disk_image")
+        self.assertEqual(classify(Path("notes.txt")), "")
 
     def test_initrd_initrd_extension(self):
         """The .initrd extension is recognized."""
@@ -1447,6 +1662,25 @@ class TestSendProxyReply(unittest.TestCase):
         self.assertEqual(target, ("10.0.0.50", 4011))
         self.assertEqual(data[0], 2)
         self.assertIn(b"undionly.kpxe", data)
+
+    def test_reply_from_zero_source_goes_to_broadcast(self):
+        """A client with no address yet sends from 0.0.0.0 per RFC 2131.
+
+        sendto(("0.0.0.0", 68)) is routed to *this host's* loopback, so the
+        reply used to be delivered to ourselves and the client never booted.
+        It must go to the subnet broadcast instead.
+        """
+        mock_sock = MagicMock()
+        info = {
+            "client_address": ("0.0.0.0", 68),
+            "transaction_id": b"\x01\x02\x03\x04",
+            "mac_raw": b"\xaa\xbb\xcc\xdd\xee\xff",
+            "mac_readable": "aa:bb:cc:dd:ee:ff",
+            "boot_file": "undionly.kpxe",
+        }
+        send_proxy_reply(mock_sock, info, "10.0.0.1")
+        _, target = mock_sock.sendto.call_args[0]
+        self.assertEqual(target, ("10.0.0.255", 68))
 
     def test_ipxe_efi(self):
         mock_sock = MagicMock()
@@ -1752,7 +1986,9 @@ class TestUsbBootQuoting(unittest.TestCase):
         def fake_run(cmd, **kwargs):
             if len(cmd) > 2:
                 cmds.append(cmd[2])
-            return MagicMock(stdout="")
+            # A successful su. present_iso now uses check=True, so a non-zero
+            # returncode here would raise instead of being reported.
+            return MagicMock(stdout="", stderr="", returncode=0)
 
         with tempfile.TemporaryDirectory() as tmp:
             mod.LOG_FILE = Path(tmp) / "test.log"
@@ -1760,6 +1996,60 @@ class TestUsbBootQuoting(unittest.TestCase):
                 with patch.object(mod.time, "sleep"):
                     mod.present_iso(Path(path_str))
         return cmds
+
+    @staticmethod
+    def _run_present_iso_failing(path_str: str, returncode: int, stderr: str):
+        """Run present_iso where su fails. Returns the exception raised."""
+        from unittest.mock import MagicMock
+
+        mod = TestUsbBootQuoting._load_module()
+
+        def fake_run(cmd, **kwargs):
+            return MagicMock(stdout="", stderr=stderr, returncode=returncode)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.LOG_FILE = Path(tmp) / "test.log"
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                with patch.object(mod.time, "sleep"):
+                    return mod.present_iso(Path(path_str))
+
+    def test_present_iso_raises_when_su_fails(self):
+        """A refused ConfigFS write must stop the workflow.
+
+        This is the documented failure mode (SELinux blocks ConfigFS writes).
+        Previously the return code was discarded, so the script logged "ISO
+        presented — PC should see USB CD-ROM now" and carried on through the
+        whole flow with nothing actually presented.
+        """
+        with self.assertRaises(RuntimeError):
+            self._run_present_iso_failing(
+                "/sdcard/DiskImages/arch.iso",
+                returncode=1,
+                stderr="avc: denied { write } for path=lun.0",
+            )
+
+    def test_present_iso_error_logged_not_just_raised(self):
+        """The reason must reach the log, not just the traceback."""
+        import contextlib
+        import io
+
+        mod = TestUsbBootQuoting._load_module()
+        from unittest.mock import MagicMock
+
+        def fake_run(cmd, **kwargs):
+            return MagicMock(stdout="", stderr="avc: denied", returncode=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.LOG_FILE = Path(tmp) / "test.log"
+            buf = io.StringIO()
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                with patch.object(mod.time, "sleep"):
+                    with contextlib.redirect_stdout(buf):
+                        with self.assertRaises(RuntimeError):
+                            mod.present_iso(Path("/sdcard/DiskImages/arch.iso"))
+            log_contents = mod.LOG_FILE.read_text()
+        self.assertIn("avc: denied", buf.getvalue())
+        self.assertIn("avc: denied", log_contents)
 
     def test_present_iso_quotes_malicious_filename(self):
         cmds = self._run_present_iso("/sdcard/DiskImages/pwn$(id > /data/owned).iso")
@@ -1842,6 +2132,47 @@ class TestClientJourney(unittest.TestCase):
             journey.record(f"192.0.{i // 256}.{i % 256}", "DHCP", f"OFFER {i}")
         self.assertLessEqual(len(journey._journeys), journey.MAX_JOURNEYS + 1)
 
+    def test_eviction_keeps_alias_pairs_together(self):
+        """Eviction must drop a MAC and its IP together.
+
+        Deleting only one key leaves the other pointing at a journey that can
+        no longer find its MAC, and the next event on that key builds a second,
+        disconnected chain — one machine rendered as two unrelated chains.
+        """
+        from src import client_journey as journey
+
+        journey.link_ip_to_mac("192.0.2.10", "aa:bb:cc:dd:ee:ff")
+        journey.record("aa:bb:cc:dd:ee:ff", "DHCP", "ACK 192.0.2.10")
+
+        original_max = journey.MAX_JOURNEYS
+        try:
+            journey.MAX_JOURNEYS = 2
+            for i in range(20):
+                journey.record(f"10.0.0.{i}", "DHCP", f"OFFER {i}")
+        finally:
+            journey.MAX_JOURNEYS = original_max
+
+        mac_present = "aa:bb:cc:dd:ee:ff" in journey._journeys
+        ip_present = "192.0.2.10" in journey._journeys
+        self.assertEqual(mac_present, ip_present,
+                         "one alias was evicted without the other")
+
+    def test_relinking_recycled_ip_drops_stale_chain(self):
+        """The DHCP pool recycles addresses. Re-linking an IP to a new MAC must
+        not keep rendering the previous machine's boot chain."""
+        from src import client_journey as journey
+
+        journey.link_ip_to_mac("192.0.2.10", "aa:bb:cc:dd:ee:01")
+        journey.record("aa:bb:cc:dd:ee:01", "DHCP", "ACK 192.0.2.10")
+
+        # Address recycled to a different client.
+        journey.link_ip_to_mac("192.0.2.10", "aa:bb:cc:dd:ee:02")
+        out = self._capture(journey.record, "192.0.2.10", "TFTP", "undionly.kpxe")
+
+        self.assertIn("[aa:bb:cc:dd:ee:02]", out)
+        self.assertNotIn("ACK 192.0.2.10", out,
+                         "stale chain from the previous client leaked through")
+
 
 # --- Pre-flight Checks ---
 
@@ -1910,6 +2241,96 @@ class TestPreflight(unittest.TestCase):
             )
         self.assertTrue(result.ok, msg=str(result.errors))
 
+    def test_non_root_warns_about_missing_efi_loader(self):
+        """Non-root mode picks ipxe.efi for UEFI clients regardless of
+        --boot-file, so its absence must be visible before a client stalls."""
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=False,
+                server_ip="127.0.0.1",
+                boot_file="undionly.kpxe",
+                boot_root=Path(tmp),
+                dhcp_port=0,
+                tftp_port=0,
+                http_port=0,
+                boot_files=["undionly.kpxe"],
+                optional_boot_files=["ipxe.efi"],
+                check_ports=False,
+            )
+        # Missing loader is a warning, not a fatal: BIOS-only setups are valid.
+        self.assertTrue(result.ok, msg=str(result.errors))
+        joined = "\n".join(result.warnings)
+        self.assertIn("ipxe.efi", joined)
+
+    def test_non_root_requires_bios_loader(self):
+        """undionly.kpxe is always advertised in non-root mode, so its absence
+        must be fatal even if --boot-file names something else."""
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ipxe.efi").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=False,
+                server_ip="127.0.0.1",
+                boot_file="ipxe.efi",
+                boot_root=Path(tmp),
+                dhcp_port=0,
+                tftp_port=0,
+                http_port=0,
+                boot_files=["undionly.kpxe"],
+                check_ports=False,
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("undionly.kpxe", "\n".join(result.errors))
+
+    def test_root_mode_does_not_check_efi_loader(self):
+        """Root mode advertises only --boot-file, so a missing ipxe.efi is
+        irrelevant and must not produce a warning."""
+        from src.preflight import run_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+            result = run_preflight(
+                root_mode=True,
+                server_ip="127.0.0.1",
+                boot_file="undionly.kpxe",
+                boot_root=Path(tmp),
+                dhcp_port=0,
+                tftp_port=0,
+                http_port=0,
+                boot_files=["undionly.kpxe"],
+                check_ports=False,
+            )
+        self.assertNotIn("ipxe.efi", "\n".join(result.warnings))
+
+    def test_skip_port_check_ignores_busy_port(self):
+        """The pre-kill pass must not report the running instance's own ports."""
+        from src.preflight import run_preflight
+
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("", 0))
+        blocker.listen(1)
+        busy_port = blocker.getsockname()[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "undionly.kpxe").write_bytes(b"x")
+                result = run_preflight(
+                    root_mode=False,
+                    server_ip="127.0.0.1",
+                    boot_file="undionly.kpxe",
+                    boot_root=Path(tmp),
+                    dhcp_port=0,
+                    tftp_port=0,
+                    http_port=busy_port,
+                    check_ports=False,
+                )
+            self.assertTrue(result.ok, msg=str(result.errors))
+        finally:
+            blocker.close()
+
     def test_remote_server_ip_flagged(self):
         from src.preflight import run_preflight
 
@@ -1950,6 +2371,63 @@ class TestPreflight(unittest.TestCase):
             self.assertIn(f"HTTP port {busy_port} is already in use", joined)
         finally:
             blocker.close()
+
+
+# --- TFTP symlink containment ---
+
+class TestPathGuard(unittest.TestCase):
+    """The one implementation of the boot-dir jail, shared by TFTP and HTTP."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.root = Path(self.tmpdir).resolve()
+        (self.root / "inside.txt").write_bytes(b"INSIDE")
+        self.outside = Path(tempfile.mkdtemp()) / "secret.txt"
+        self.outside.write_bytes(b"SECRET")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        self.outside.unlink(missing_ok=True)
+
+    def test_plain_file_inside_allowed(self):
+        from src.pathguard import resolve_within
+
+        got = resolve_within(self.root, self.root / "inside.txt")
+        self.assertIsNotNone(got)
+
+    def test_symlink_outside_rejected(self):
+        from src.pathguard import resolve_within
+
+        link = self.root / "link.txt"
+        try:
+            link.symlink_to(self.outside)
+        except OSError:
+            self.skipTest("Cannot create symlinks")
+        self.assertIsNone(resolve_within(self.root, link))
+
+    def test_parent_traversal_rejected(self):
+        from src.pathguard import resolve_within
+
+        self.assertIsNone(resolve_within(self.root, self.root / ".." / "etc"))
+
+    def test_root_itself_counts_as_inside(self):
+        from src.pathguard import resolve_within
+
+        self.assertIsNotNone(resolve_within(self.root, self.root))
+
+    def test_embedded_nul_returns_none(self):
+        from src.pathguard import resolve_within
+
+        self.assertIsNone(resolve_within(self.root, self.root / "a\x00b"))
+
+    def test_native_join_drops_empty_segments(self):
+        from src.pathguard import native_join
+
+        self.assertEqual(
+            native_join(Path("/boot"), "//a//b"), Path("/boot/a/b")
+        )
 
 
 if __name__ == "__main__":

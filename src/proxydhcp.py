@@ -1,9 +1,18 @@
-"""ProxyDHCP server — intercepts PXE client requests and directs them to the bootloader.
+"""ProxyDHCP server — answers PXE clients with a boot file, nothing more.
 
-Non-root mode (port 4011): works alongside an existing DHCP server (e.g. your router).
-Only responds to PXE clients after the network's DHCP assigns an IP.
+Non-root mode (port 4011, --port): runs alongside an existing DHCP server
+(e.g. your router). The router assigns the address; this server only adds the
+PXE options, so it sends no yiaddr and no subnet/router options.
 
-Root mode (port 67): replaces the existing DHCP server entirely (see dhcp_server.py).
+It answers *any* BOOTREQUEST carrying option 60 (PXEClient) regardless of
+message type, and always replies with DHCPACK. Clients accept that in the
+proxy flow.
+
+The loader is chosen from the client's architecture (see _detect_boot_file)
+rather than from --boot-file, which root mode uses instead.
+
+Root mode (port 67): replaces the existing DHCP server entirely — see
+dhcp_server.py.
 """
 
 import socket
@@ -74,6 +83,19 @@ def parse_packet(data: bytes, addr: tuple[str, int]) -> dict[str, object] | None
     }
 
 
+#: Boot loaders this server can advertise. Kept next to the detection logic
+#: so pre-flight can validate exactly the set that will be served instead of
+#: guessing.
+BIOS_LOADER = "undionly.kpxe"
+EFI_LOADER = "ipxe.efi"
+PROXY_BOOT_FILES = (BIOS_LOADER, EFI_LOADER)
+
+
+def _subnet_broadcast(server_ip: str) -> str:
+    """Broadcast address for server_ip's /24 — matches the root-mode DHCP path."""
+    return ".".join(server_ip.split(".")[:3]) + ".255"
+
+
 def _detect_boot_file(vendor_class: bytes) -> str:
     """Choose the right iPXE bootloader based on PXE client architecture.
 
@@ -126,15 +148,30 @@ def send_proxy_reply(
     packet += b"\x43" + bytes([len(boot_file)]) + boot_file  # option 67: boot file name
     packet += b"\xff"  # end marker
 
-    # Reply to the actual source port — not hardcoded 68
-    # PXE clients may send from ephemeral ports
-    target_address = (
+    # Where to send the reply.
+    #
+    # Normally unicast back to the source: a client that already has an address
+    # (mid-RENEW, or a ROM that sends the proxy request late) gets a targeted
+    # reply. But a client with no address yet sends from 0.0.0.0, as RFC 2131
+    # specifies, and sendto(("0.0.0.0", 68)) is routed to *this* host's
+    # loopback — the reply would be delivered to ourselves and the client would
+    # never see it. Use the subnet broadcast in that case, which is what the
+    # full DHCP server does unconditionally.
+    src_ip, src_port = (
         client_info["client_address"][0],
         client_info["client_address"][1],
     )
+    if src_ip in ("0.0.0.0", "::"):
+        dst_ip = _subnet_broadcast(server_ip)
+        dst_port = 68
+    else:
+        dst_ip = src_ip
+        dst_port = src_port or 68
+
+    target_address = (dst_ip, dst_port)
     sock.sendto(packet, target_address)
     journey.record(
-        target_address[0],
+        dst_ip,
         "PXE",
         f"{client_info['boot_file']} ({client_info['mac_readable']})",
     )
@@ -161,5 +198,11 @@ def _proxydhcp_listener(
             except TimeoutError:
                 continue
             client_info = parse_packet(data, addr)
-            if client_info:
+            if not client_info:
+                continue
+            try:
                 send_proxy_reply(s, client_info, server_ip)
+            except OSError as e:
+                # Same reasoning as the full DHCP listener: a reply that cannot
+                # be delivered must not kill the listener. Report and continue.
+                print(f"[!] ProxyDHCP: failed to reply to {addr}: {e}")

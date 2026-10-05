@@ -1,10 +1,21 @@
 """iPXE boot config generator — scans a directory and auto-generates boot.cfg.
 
-boot.cfg is an iPXE script that shows a menu of available ISOs and kernels.
-iPXE loads this from the HTTP server (port 8080) after the TFTP stage.
+boot.cfg is an iPXE script presenting a menu of the images and kernels found in
+the boot directory. iPXE fetches it over HTTP (port 8080) after the TFTP stage.
+
+Two rules keep it correct rather than merely working:
+
+* Embedded paths are POSIX-style and screened for iPXE metacharacters, since a
+  filename on disk becomes a line of a script every booting client executes.
+* Only files the HTTP server will actually serve are listed. Anything else
+  (escaping symlink, unsafe name) is skipped *with a warning* — a silent drop
+  looks identical to "you have no boot files", which is the failure this whole
+  generator exists to prevent.
 """
 
 from pathlib import Path
+
+from src import pathguard
 
 # Characters allowed in relative paths embedded in boot.cfg. Anything else
 # (control chars, $ ` ' " ; & | < > \ # % { } : etc.) could let a crafted
@@ -40,7 +51,15 @@ def _make_safe_key(rel_path: str, used: set[str]) -> str:
     return key
 
 
-_INITRD_EXTENSIONS = frozenset({".initrd", ".img"})
+# ".img" is deliberately NOT here: both a raw disk image and an initramfs can
+# legitimately be named *.img, and treating every one of them as an initrd made
+# unpaired disk images vanish from the menu. A file is an initrd if it *looks*
+# like one — see _is_initrd and classify.
+_INITRD_EXTENSIONS = frozenset({".initrd"})
+_DISK_IMAGE_EXTENSIONS = frozenset({".iso", ".img"})
+# Every suffix that is part of a boot filename rather than part of its version.
+_KERNEL_EXTENSIONS = frozenset({".kernel", ".vmlinuz", ".bzimage"})
+_BOOT_EXTENSIONS = _KERNEL_EXTENSIONS | _INITRD_EXTENSIONS | _DISK_IMAGE_EXTENSIONS
 _INITRD_NAMES = frozenset({"initrd", "initramfs"})
 _IGNORED_NAMES = frozenset({"boot.cfg", ".DS_Store", "undionly.kpxe", "ipxe.efi"})
 _IGNORED_DIRS = frozenset(
@@ -62,7 +81,11 @@ _IGNORED_DIRS = frozenset(
 
 
 def _is_initrd(path: Path) -> bool:
-    """Check if a file looks like an initrd/initramfs."""
+    """Check if a file looks like an initrd/initramfs.
+
+    Name-based on purpose: an `initramfs-*.img` is an initrd even though
+    `.img` is also the disk-image extension. See _INITRD_EXTENSIONS.
+    """
     ext = path.suffix.lower()
     if ext in _INITRD_EXTENSIONS:
         return True
@@ -79,6 +102,49 @@ def _is_kernel(path: Path) -> bool:
     if name_lower.startswith("vmlinuz") or name_lower.startswith("bzimage"):
         return True
     return False
+
+
+def _is_disk_image(path: Path) -> bool:
+    """Check if a file is a bootable disk image (sanboot target)."""
+    return path.suffix.lower() in _DISK_IMAGE_EXTENSIONS
+
+
+def _strip_boot_ext(name: str) -> str:
+    """Strip a *known* boot extension, leaving dotted version numbers intact.
+
+    Path.stem is the wrong tool here: Path("vmlinuz-6.1").stem == "vmlinuz-6"
+    because Python reads ".1" as a suffix, while Path("initramfs-6.1.img").stem
+    == "initramfs-6.1". The two could therefore never compare equal, so
+    vmlinuz-<ver> + initramfs-<ver> pairs only ever appeared via the
+    guess-the-fallback path rather than by actually matching.
+    """
+    lowered = name.lower()
+    for ext in sorted(_BOOT_EXTENSIONS, key=len, reverse=True):
+        if lowered.endswith(ext) and len(name) > len(ext):
+            return name[: -len(ext)]
+    return name
+
+
+def classify(path: Path) -> str:
+    """Classify one file as 'initrd', 'kernel' or 'disk_image'.
+
+    A single ordered decision replaces the old four-pass scheme. The passes
+    disagreed about priority: the initrd pass ran before the image pass, so
+    `arch.iso` was fine but any `.img` was claimed as an initrd no matter
+    what it was, and the later "unclaimed images" pass could therefore never
+    fire. Order here matters only for genuinely ambiguous names, and it puts
+    the more specific "looks like an initrd" judgement ahead of the generic
+    ".img means disk image" one.
+
+    Returns "" for anything that isn't bootable.
+    """
+    if _is_initrd(path):
+        return "initrd"
+    if _is_kernel(path):
+        return "kernel"
+    if _is_disk_image(path):
+        return "disk_image"
+    return ""
 
 
 def _label_from_filename(name: str) -> str:
@@ -98,104 +164,130 @@ def generate_boot_config(boot_dir: Path) -> Path:
     """Scan boot_dir recursively for bootable images and write an iPXE menu script.
 
     Detects three patterns:
-        - .iso files           -> booted via sanboot (direct ISO boot)
+        - .iso / .img images    -> booted via sanboot (direct disk boot)
         - vmlinuz + initrd     -> booted via kernel/initrd direct boot
         - standalone kernels   -> booted via kernel-only direct boot
 
     Writes boot.cfg to boot_dir and returns its path.
     """
-    iso_files: list[str] = []
+    image_files: list[str] = []
     kernel_initrd_pairs: list[tuple[str, str]] = []
     standalone_kernels: list[str] = []
 
-    # Collect all relevant files recursively (skip ignored)
-    # key: lowercase relative path, value: (full Path, relative path string)
+    # Every candidate file under boot_dir, keyed by lowercased relative path.
+    # Case-folding is deliberate: on a case-insensitive filesystem (macOS,
+    # Windows) Arch.iso and arch.iso are one file, and listing both would
+    # produce two menu entries that resolve to the same bytes.
     all_files: dict[str, tuple[Path, str]] = {}
     for f in sorted(boot_dir.rglob("*")):
         rel = f.relative_to(boot_dir)
-        # Skip hidden dirs, venv, pycache, macOS/Windows junk
+        # Skip venv/pycache dirs and macOS/Windows system junk
         if any(part in _IGNORED_DIRS for part in rel.parts):
             continue
-        # Skip macOS resource forks (._prefix) and .fseventsd/.visync
-        if f.name.startswith("._") or f.name.startswith("."):
+        # Hidden files, and macOS resource forks (._prefix)
+        if f.name.startswith("."):
             continue
-        if f.is_file() and f.name not in _IGNORED_NAMES:
-            rel_path = str(rel)
-            if not _is_safe_boot_path(rel_path):
-                print(
-                    f"[!] boot.cfg: skipping {rel_path!r} — filename contains "
-                    "characters that are unsafe to embed in an iPXE script"
-                )
-                continue
-            all_files[rel_path.lower()] = (f, rel_path)
+        if f.name in _IGNORED_NAMES:
+            continue
+        if not f.is_file():
+            continue
+        # as_posix() keeps the embedded path identical on every platform;
+        # a native separator would both trip _is_safe_boot_path (backslash is
+        # on the unsafe list) and stop matching the URL HTTP is asked for.
+        rel_path = rel.as_posix()
+        if not _is_safe_boot_path(rel_path):
+            print(
+                f"[!] boot.cfg: skipping {rel_path!r} — filename contains "
+                "characters that are unsafe to embed in an iPXE script"
+            )
+            continue
+        # Only list files the HTTP server will actually serve. A symlink
+        # pointing outside the boot dir used to become a permanent menu entry
+        # that returned 403 for every client.
+        if pathguard.resolve_within(boot_dir, f) is None:
+            print(
+                f"[!] boot.cfg: skipping {rel_path!r} — resolves outside the "
+                f"boot directory and would 403 over HTTP"
+            )
+            continue
+        all_files[rel_path.lower()] = (f, rel_path)
 
     def _label_from_relpath(rel_path: str) -> str:
-        return _label_from_filename(Path(rel_path).name)
+        return _label_from_filename(rel_path.rsplit("/", 1)[-1])
 
-    # Pass 1: ISOs are unambiguous
-    claimed: set[str] = set()
-    for rel_lower, (path, rel_path) in all_files.items():
-        if path.suffix.lower() == ".iso":
-            iso_files.append(rel_path)
-            claimed.add(rel_lower)
-
-    # Pass 2: Identify initrds
+    # Collect initrds first, then pair them with kernels. classify() resolves
+    # the ordering ambiguity in one place instead of via competing passes.
     initrds: dict[str, str] = {}
     for rel_lower, (path, rel_path) in all_files.items():
-        if rel_lower in claimed:
+        if classify(path) != "initrd":
             continue
-        if _is_initrd(path):
-            base = path.stem.lower()
-            for prefix in ("initramfs-", "initrd-"):
-                if base.startswith(prefix):
-                    base = base[len(prefix) :]
-                    break
-            for suffix in ("-initrd", "-initramfs", "_initrd", "_initramfs"):
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-                    break
-            initrds[base] = rel_path
-            claimed.add(rel_lower)
+        base = _strip_boot_ext(path.name).lower()
+        for prefix in ("initramfs-", "initrd-"):
+            if base.startswith(prefix):
+                base = base[len(prefix) :]
+                break
+        for suffix in ("-initrd", "-initramfs", "_initrd", "_initramfs"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        initrds[base] = rel_path
 
-    # Pass 3: Identify kernels and pair with initrds
+    claimed_initrds: set[str] = set()
     for rel_lower, (path, rel_path) in all_files.items():
-        if rel_lower in claimed:
-            continue
-        if _is_kernel(path):
-            base = path.stem.lower()
+        kind = classify(path)
+        if kind == "disk_image":
+            image_files.append(rel_path)
+        elif kind == "kernel":
+            base = _strip_boot_ext(path.name).lower()
             for prefix in ("vmlinuz-", "bzimage-"):
                 if base.startswith(prefix):
                     base = base[len(prefix) :]
                     break
 
             if base in initrds:
-                kernel_initrd_pairs.append((rel_path, initrds.pop(base)))
-                claimed.add(rel_lower)
+                initrd = initrds[base]
+                claimed_initrds.add(initrd)
+                kernel_initrd_pairs.append((rel_path, initrd))
             else:
                 standalone_kernels.append(rel_path)
-                claimed.add(rel_lower)
 
-    # Remaining unclaimed .img files become standalone
-    for rel_lower, (path, rel_path) in all_files.items():
-        if rel_lower not in claimed and path.suffix.lower() in (
-            ".img",
-            ".kernel",
-            ".vmlinuz",
-            ".bzImage",
-        ):
-            standalone_kernels.append(rel_path)
-            claimed.add(rel_lower)
+    leftovers = [
+        rel for rel in initrds.values() if rel not in claimed_initrds
+    ]
 
-    # Fallback: pair first unpaired initrd with first standalone kernel
-    if initrds and standalone_kernels:
-        kern = standalone_kernels.pop(0)
-        initrd = next(iter(initrds.values()))
-        initrds.clear()
-        kernel_initrd_pairs.insert(0, (kern, initrd))
+    # Unambiguous rescue: exactly one kernel and one initrd left over is almost
+    # certainly a pair whose names just didn't line up, so take it — but say so,
+    # since it is a guess. Guessing with more than one candidate is not safe:
+    # the wrong initrd panics the kernel at boot, so ambiguous leftovers are
+    # only reported.
+    if len(leftovers) == 1 and len(standalone_kernels) == 1:
+        kern = standalone_kernels.pop()
+        initrd = leftovers[0]
+        kernel_initrd_pairs.append((kern, initrd))
+        print(
+            f"[!] boot.cfg: pairing {kern!r} with {initrd!r} by position — "
+            "no name match found. Rename them (vmlinuz-<ver> / initramfs-<ver>) "
+            "to make this explicit."
+        )
+        leftovers = []
+    elif leftovers and standalone_kernels:
+        print(
+            f"[!] boot.cfg: {len(leftovers)} initrd(s) and "
+            f"{len(standalone_kernels)} kernel(s) could not be matched by name:"
+        )
+        for rel in leftovers:
+            print(f"      unpaired initrd: {rel}")
+        for rel in standalone_kernels:
+            print(f"      unpaired kernel: {rel}")
+
+    # An initrd with no kernel is not bootable on its own, and handing it to
+    # an unrelated kernel panics at boot. Say so instead of dropping it.
+    for rel_path in leftovers:
+        print(f"[!] boot.cfg: ignoring unpaired initrd {rel_path!r}")
 
     # Unique, sanitized goto labels — collisions would corrupt the menu
     used_keys: set[str] = set(_RESERVED_KEYS)
-    iso_keys = [_make_safe_key(p, used_keys) for p in iso_files]
+    image_keys = [_make_safe_key(p, used_keys) for p in image_files]
     pair_keys = [_make_safe_key(k, used_keys) for k, _ in kernel_initrd_pairs]
     kern_keys = [_make_safe_key(k, used_keys) for k in standalone_kernels]
 
@@ -207,12 +299,12 @@ def generate_boot_config(boot_dir: Path) -> Path:
     script += ":menu\n"
     script += "menu servings-cli PXE Boot Server\n"
 
-    has_items = bool(iso_files or kernel_initrd_pairs or standalone_kernels)
+    has_items = bool(image_files or kernel_initrd_pairs or standalone_kernels)
 
-    if iso_files:
+    if image_files:
         script += "item --gap -- Disk Images\n"
-        for key, iso in zip(iso_keys, iso_files):
-            script += f"item {key}    {_label_from_relpath(iso)}\n"
+        for key, image in zip(image_keys, image_files):
+            script += f"item {key}    {_label_from_relpath(image)}\n"
 
     if kernel_initrd_pairs:
         script += "item --gap -- Kernel + Initrd\n"
@@ -231,9 +323,9 @@ def generate_boot_config(boot_dir: Path) -> Path:
 
     script += "\nchoose target || goto boot_none\n\n"
 
-    for key, iso in zip(iso_keys, iso_files):
+    for key, image in zip(image_keys, image_files):
         script += f":{key}\n"
-        script += f"set boot-path /{iso}\n"
+        script += f"set boot-path /{image}\n"
         script += "sanboot ${boot-path} || goto failed\n\n"
 
     for (kern, initrd), key in zip(kernel_initrd_pairs, pair_keys):
@@ -261,6 +353,7 @@ def generate_boot_config(boot_dir: Path) -> Path:
     cfg_path = boot_dir / "boot.cfg"
     cfg_path.write_text(script, encoding="utf-8")
     print(
-        f"[+] Generated boot.cfg ({len(iso_files)} ISOs, {len(kernel_initrd_pairs)} pairs, {len(standalone_kernels)} kernels)"
+        f"[+] Generated boot.cfg ({len(image_files)} images, "
+        f"{len(kernel_initrd_pairs)} pairs, {len(standalone_kernels)} kernels)"
     )
     return cfg_path

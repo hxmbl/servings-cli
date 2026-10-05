@@ -37,10 +37,11 @@ _ISO_EXTENSIONS = frozenset({".iso", ".img"})
 
 
 def _detect_usb_boot_dirs() -> list[Path]:
-    """Scan mounted removable drives for ISOs and boot files.
+    """Scan mounted removable drives for boot images.
 
-    Looks for drives that contain .iso files or Ventoy marker files.
-    Checks /mnt/*, /media/*, /run/media/* mount points.
+    Keeps drives that contain an image file (.iso/.img) or a Ventoy marker.
+    Checks /mnt/*, /media/*, /run/media/* — these are POSIX mount conventions,
+    so this finds nothing on Windows and is skipped there.
     """
     candidates: list[Path] = []
     mount_roots = [Path("/mnt"), Path("/media"), Path("/run/media")]
@@ -48,7 +49,11 @@ def _detect_usb_boot_dirs() -> list[Path]:
     for mount_root in mount_roots:
         if not mount_root.exists():
             continue
-        for entry in mount_root.iterdir():
+        try:
+            entries = list(mount_root.iterdir())
+        except PermissionError:
+            continue
+        for entry in entries:
             try:
                 if not entry.is_dir():
                     continue
@@ -109,27 +114,37 @@ def _validate_port(value: int, name: str) -> int:
     return value
 
 
+def _count_images(d: Path) -> int:
+    """Count boot images on a drive, tolerating a mount that vanished."""
+    try:
+        return sum(
+            1
+            for f in d.iterdir()
+            if f.is_file() and f.suffix.lower() in _ISO_EXTENSIONS
+        )
+    except OSError:
+        return 0
+
+
 def _resolve_boot_dir(explicit: str | None, android: bool = False) -> str | None:
     if explicit:
         return explicit
-    candidates = list(_BOOT_DIR_CANDIDATES)
+    # --android is an explicit request for the shared-storage layout, so those
+    # directories are checked first. Otherwise Termux's $HOME can hold a
+    # servings-boot/ from an earlier run that wins on existence alone, and the
+    # DiskImages the DriveDroid flow depends on are never served.
+    candidates: list[Path] = []
     if android:
         candidates.extend(_ANDROID_BOOT_DIR_CANDIDATES)
+    candidates.extend(_BOOT_DIR_CANDIDATES)
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    # Auto-detect mounted USB drives with ISOs
+    # Auto-detect mounted USB drives holding boot images
     usb_dirs = _detect_usb_boot_dirs()
     if usb_dirs:
-        # Prefer the one with the most ISOs
-        best = max(
-            usb_dirs,
-            key=lambda d: sum(
-                1
-                for f in d.iterdir()
-                if f.is_file() and f.suffix.lower() in _ISO_EXTENSIONS
-            ),
-        )
+        # Prefer the drive with the most images on it
+        best = max(usb_dirs, key=_count_images)
         print(f"[*] Auto-detected USB drive: {best}")
         return str(best)
     # No silent CWD fallback — serving the current directory over HTTP would
@@ -140,6 +155,12 @@ def _resolve_boot_dir(explicit: str | None, android: bool = False) -> str | None
 
 
 def _detect_android_ip() -> str | None:
+    """First IPv4 address on a USB-tethering interface, if one has one.
+
+    Tries the RNDIS/USB names first and falls back to eth0. Uses the `ip`
+    command, so it finds nothing without it — pre-flight then rejects the
+    default server IP with a message naming the local addresses.
+    """
     import subprocess
 
     for iface in ("rndis0", "usb0", "eth0"):

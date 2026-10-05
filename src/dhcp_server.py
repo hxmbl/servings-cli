@@ -4,11 +4,19 @@ Root mode: replaces the network's DHCP server on port 67, providing
 both IP assignment and PXE options (60/66/67) so clients auto-discover
 the boot server.
 
+Every DISCOVER and REQUEST is answered, PXE or not, with the PXE options
+included. Replies go to the subnet broadcast on port 68, since the client may
+not have an address yet.
+
+Addresses come from IPPool, which is fixed-size and has no lease expiry —
+see that class for why.
+
 Non-root mode is handled by proxydhcp.py on port 4011 instead.
 """
 
 import socket
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from src import client_journey as journey
@@ -40,8 +48,17 @@ MAGIC_COOKIE = b"\x63\x82\x53\x63"
 class IPPool:
     """Simple IP pool — assigns addresses from a /24 subnet.
 
-    Wraps around when exhausted, evicting the oldest lease so two clients are
-    never handed the same address at the same time.
+    No lease expiry: leases last until the process exits. This is a PXE server
+    for temporary sessions, so that is the right trade — a client that walks
+    away just leaves an entry behind, and the pool is only ever recycled after
+    ~101 distinct clients in one run.
+
+    Wraps around when exhausted, evicting the holder of the address it reuses.
+    Note what that means: eviction is *not* a way of avoiding address
+    conflicts, it is the moment one is created. The evicted client still holds
+    that address and is never told. Every eviction is therefore logged —
+    silently recycling an address is how you get two machines that both
+    believe they own it, with no hint in the console as to why.
     """
 
     subnet: str = "192.168.42"
@@ -49,6 +66,9 @@ class IPPool:
     max_ip: int = 200
     leases: dict[str, str] = field(default_factory=dict)
     ip_owner: dict[str, str] = field(default_factory=dict)
+    #: Called with (ip, evicted_mac, new_mac) whenever the pool must recycle an
+    #: address that is still recorded as leased. Used by the listener to warn.
+    on_evict: "Callable[[str, str, str], None] | None" = None
 
     def allocate(self, mac: str) -> str:
         """Assign an IP to a MAC. Reuses existing lease if present."""
@@ -57,9 +77,13 @@ class IPPool:
 
         ip = f"{self.subnet}.{self.next_ip}"
         if ip in self.ip_owner:
-            # Pool wrapped around onto a live lease — evict its holder first
+            # Pool wrapped around onto an address another client still holds.
+            # Evict so we never hand the same address to two recorded leases,
+            # but say out loud that we did it: the previous holder is not told.
             victim = self.ip_owner.pop(ip)
             del self.leases[victim]
+            if self.on_evict is not None:
+                self.on_evict(ip, victim, mac)
 
         self.leases[mac] = ip
         self.ip_owner[ip] = mac
@@ -200,6 +224,16 @@ def dhcp_listener(
     parts = server_ip.split(".")
     subnet = ".".join(parts[:3])
     pool.subnet = subnet
+    broadcast = f"{subnet}.255"
+
+    def _warn_eviction(ip: str, victim: str, new_mac: str) -> None:
+        print(
+            f"[!] DHCP: address pool exhausted — recycling {ip} from "
+            f"{victim} to {new_mac}.\n"
+            f"    {victim} may still be using this address."
+        )
+
+    pool.on_evict = _warn_eviction
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -227,7 +261,7 @@ def dhcp_listener(
             is_pxe = request["is_pxe"]
 
             ip = pool.allocate(mac_str)
-            dest = (f"{subnet}.255", 68)
+            dest = (broadcast, 68)
             journey.link_ip_to_mac(ip, mac_str)
 
             tag = "PXE" if is_pxe else "DHCP"
@@ -237,10 +271,21 @@ def dhcp_listener(
                 resp = _build_bootp_packet(
                     request, ip, server_ip, DHCP_OFFER, boot_file
                 )
-                s.sendto(resp, dest)
-                journey.record(mac_str, "DHCP", f"OFFER {ip}")
-
+                detail = f"OFFER {ip}"
             elif request["msg_type"] == DHCP_REQUEST:
                 resp = _build_bootp_packet(request, ip, server_ip, DHCP_ACK, boot_file)
+                detail = f"ACK {ip}"
+            else:
+                continue
+
+            try:
                 s.sendto(resp, dest)
-                journey.record(mac_str, "DHCP", f"ACK {ip}")
+            except OSError as e:
+                # A reply that cannot be sent (route withdrawn, interface down,
+                # broadcast refused) must not take down the listener: the
+                # exception used to escape the thread and kill DHCP entirely,
+                # so one unreachable client stopped the whole boot chain.
+                # Report it and keep serving.
+                print(f"[!] DHCP: failed to send {detail} to {mac_str}: {e}")
+                continue
+            journey.record(mac_str, "DHCP", detail)

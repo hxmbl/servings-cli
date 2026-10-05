@@ -4,10 +4,22 @@ Historical failure mode: the banner printed, all listeners said "listening",
 and no client ever booted — because the advertised server IP wasn't on any
 interface, or the bootloader wasn't in the boot dir, or another DHCP server
 owned the network. Every one of those is detectable before a client tries.
+
+Split by whether the answer depends on the ports being free:
+
+* ``check_ports=False`` — config only. Run before taking over from a running
+  instance, which still owns the ports.
+* ``check_ports=True`` — the above plus port availability. Run after the kill.
+
+Bootloaders come in two flavours: ``boot_files`` must be present and
+allowlisted, while ``optional_boot_files`` are only advertised to some clients
+(a missing ipxe.efi breaks UEFI clients only, so it is a warning).
 """
 
+import os
 import socket
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from src.tftp import ALLOWED_BOOT_FILES
@@ -54,11 +66,17 @@ def local_interface_ips() -> list[str]:
     return local
 
 
-def udp_port_free(port: int) -> bool:
-    """Mirror the flags the real listener uses, so REUSEADDR behaves identically."""
+def udp_port_free(port: int, reuse_port: bool = False) -> bool:
+    """Report whether a UDP listener could bind ``port``.
+
+    Mirrors the flags the real listener uses. ``reuse_port`` must match the
+    listener: SO_REUSEPORT lets several sockets share a port on Linux, so
+    probing with it when the listener does not use it reports "free" for a
+    port the listener would then fail to bind.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
+        if reuse_port and hasattr(socket, "SO_REUSEPORT"):
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except OSError:
@@ -71,8 +89,15 @@ def udp_port_free(port: int) -> bool:
 
 
 def tcp_port_free(port: int) -> bool:
+    """Report whether a TCP listener could bind ``port``.
+
+    Mirrors ReusableHTTPServer: SO_REUSEADDR is only set on POSIX, because on
+    Windows it means "others may bind this too" and would make a genuinely
+    busy port look free.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.name != "nt":
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind(("", port))
             return True
@@ -134,29 +159,10 @@ def _extract_server_id(reply: bytes) -> str | None:
     return None
 
 
-def run_preflight(
-    root_mode: bool,
-    server_ip: str,
-    boot_file: str,
-    boot_root: Path,
-    dhcp_port: int,
-    tftp_port: int,
-    http_port: int,
-) -> PreflightResult:
-    result = PreflightResult()
-
-    # The advertised IP must exist here — clients TFTP/HTTP to it directly,
-    # and it's handed out as router+DNS in root mode.
-    if not ip_is_local(server_ip):
-        hints = ", ".join(local_interface_ips())
-        result.errors.append(
-            f"server-ip {server_ip} is NOT assigned to any local interface.\n"
-            f"    Clients will be told to fetch boot files from {server_ip} and never connect.\n"
-            f"    Local IPs: {hints}\n"
-            f"    Fix: pass --server-ip <one of the above>"
-        )
-
-    # Bootloader must exist AND be TFTP-allowlisted, or every client stalls.
+def _check_boot_file(
+    boot_root: Path, boot_file: str, result: PreflightResult
+) -> bool:
+    """Report on one advertised bootloader. True if present and allowlisted."""
     boot_path = boot_root / boot_file
     if not boot_path.exists():
         fetch = (
@@ -170,25 +176,108 @@ def run_preflight(
             f"    Fetch it: {fetch}\n"
             f"    Or pass --boot-file with a file you've placed in {boot_root}"
         )
-    elif boot_file.encode() not in ALLOWED_BOOT_FILES:
+        return False
+    if boot_file.encode() not in ALLOWED_BOOT_FILES:
         allowed = ", ".join(sorted(n.decode() for n in ALLOWED_BOOT_FILES))
         result.errors.append(
             f"--boot-file {boot_file!r} is not in the TFTP allowlist.\n"
             f"    DHCP will advertise it but TFTP will reject every request.\n"
             f"    Allowed: {allowed}"
         )
+        return False
+    return True
 
+
+def run_preflight(
+    root_mode: bool,
+    server_ip: str,
+    boot_file: str,
+    boot_root: Path,
+    dhcp_port: int,
+    tftp_port: int,
+    http_port: int,
+    boot_files: list[str] | None = None,
+    optional_boot_files: list[str] | None = None,
+    check_ports: bool = True,
+) -> PreflightResult:
+    """Validate a startup configuration.
+
+    ``boot_files`` is the set of bootloaders that MUST be present and
+    allowlisted. Defaults to ``[boot_file]``, which is exactly what root mode
+    advertises.
+
+    ``optional_boot_files`` is the set this mode *may* advertise depending on
+    the client — non-root ProxyDHCP picks undionly.kpxe or ipxe.efi from the
+    PXE vendor class and ignores ``--boot_file`` entirely. Their absence is a
+    warning: some client classes will stall, but the config is still valid.
+
+    ``check_ports=False`` runs only the checks that don't depend on the ports
+    being free. Used for the pass that runs *before* taking over from a
+    running instance — that instance still owns the ports, so probing them
+    then would report conflicts that are about to disappear.
+    """
+    result = PreflightResult()
+
+    # The advertised IP must exist here — clients TFTP/HTTP to it directly,
+    # and it's handed out as router+DNS in root mode.
+    if not ip_is_local(server_ip):
+        hints = ", ".join(local_interface_ips())
+        result.errors.append(
+            f"server-ip {server_ip} is NOT assigned to any local interface.\n"
+            f"    Clients will be told to fetch boot files from {server_ip} and never connect.\n"
+            f"    Local IPs: {hints}\n"
+            f"    Fix: pass --server-ip <one of the above>"
+        )
+
+    # Required bootloaders must exist AND be TFTP-allowlisted, or clients stall.
+    # The caller passes the set this mode actually advertises, which is why
+    # --boot_file alone is not enough: in non-root mode ProxyDHCP chooses
+    # undionly.kpxe or ipxe.efi per client from the vendor class and never
+    # consults --boot_file, so checking it would either demand a file nobody
+    # would request or pass while the file that *would* be requested was absent.
+    for candidate in boot_files or [boot_file]:
+        _check_boot_file(boot_root, candidate, result)
+
+    # Conditionally-needed loaders. Missing one is not fatal — a BIOS-only or
+    # EFI-only network is a perfectly valid setup — but those specific clients
+    # will stall, so warn rather than fail.
+    for candidate in optional_boot_files or []:
+        if (boot_root / candidate).exists():
+            continue
+        result.warnings.append(
+            f"{candidate} is not in {boot_root}.\n"
+            "    Clients needing it will stall at TFTP.\n"
+            f"    Fetch it: curl -o {boot_root / candidate} "
+            f"{IPXE_BOOT_URL}/{candidate}"
+        )
+
+    if not check_ports:
+        return result
+
+    # Each probe must use the same socket options as the listener it stands in
+    # for, or it answers a different question than "will this bind?".
+    # The full DHCP listener sets SO_REUSEPORT; ProxyDHCP and TFTP do not.
     port_checks = [
-        ("DHCP/ProxyDHCP", dhcp_port, udp_port_free),
+        ("DHCP/ProxyDHCP", dhcp_port, partial(udp_port_free, reuse_port=root_mode)),
         ("TFTP", tftp_port, udp_port_free),
         ("HTTP", http_port, tcp_port_free),
     ]
     for service, port, check in port_checks:
         if not check(port):
+            hint = (
+                "    Another servings-cli instance? Run 'servings-cli kill' first,\n"
+                "    or override with --port / --tftp-port / --http-port."
+            )
+            if os.name == "nt":
+                # kill is a no-op on Windows, so do not send the user down a
+                # dead end; tell them what to do instead.
+                hint = (
+                    "    Another servings-cli instance may be running. On Windows\n"
+                    "    'servings-cli kill' is unsupported — stop it manually, or\n"
+                    "    override with --port / --tftp-port / --http-port."
+                )
             result.errors.append(
-                f"{service} port {port} is already in use.\n"
-                f"    Another servings-cli instance? Run 'servings-cli kill' first,\n"
-                f"    or override with --port / --tftp-port / --http-port."
+                f"{service} port {port} is already in use.\n" + hint
             )
 
     if root_mode:
