@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "servings-cli"
 version = "0.1.0"
 description = "Portable PXE/Boot server — runs on anything with Python 3.12+"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "typer>=0.12",

@@ -302,4 +302,4 @@ servings-cli kill
 
 ## License
 
-No.
+MIT — see [LICENSE](LICENSE).
