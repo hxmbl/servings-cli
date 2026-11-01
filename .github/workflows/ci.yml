@@ -26,7 +26,7 @@ jobs:
         run: pip install uv
 
       - name: Install ruff
-        run: uv pip install "ruff==0.16.4"
+        run: uv pip install --system "ruff==0.16.4"
 
       - name: ruff check
         run: ruff check src/ scripts/ test/
